@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import os
-from ipaddress import ip_address
+from ipaddress import ip_address, ip_network
 from urllib.parse import urlsplit
 
 from fastapi import Request
@@ -21,18 +21,46 @@ def loopback(host: str) -> bool:
         return False
 
 
-def _allowed_hosts() -> set[str]:
-    # SPK-OS patch: LAN 访问白名单（宿主机经 192.168.56.101 访问），
-    # 环境变量 CREATORHUB_ALLOWED_HOSTS 逗号分隔，未配置时保持上游 loopback-only 行为。
+def _allowed_config() -> tuple[set[str], list]:
+    # SPK-OS patch: LAN 访问白名单（宿主机经 192.168.56.101 访问，来源 IP 192.168.56.1），
+    # 环境变量 CREATORHUB_ALLOWED_HOSTS 逗号分隔，支持精确 IP/主机名与 CIDR 网段
+    # （如 192.168.56.0/24 覆盖宿主机来源 IP 与服务 IP）。未配置时保持上游 loopback-only 行为。
     raw = os.environ.get("CREATORHUB_ALLOWED_HOSTS", "")
-    return {h.strip().strip("[]").lower() for h in raw.split(",") if h.strip()}
+    hosts, nets = set(), []
+    for item in raw.split(","):
+        item = item.strip().strip("[]").lower()
+        if not item:
+            continue
+        if "/" in item:
+            try:
+                nets.append(ip_network(item, strict=False))
+            except ValueError:
+                continue
+        else:
+            hosts.add(item)
+    return hosts, nets
+
+
+def _host_allowed(value: str | None, hosts: set[str], nets: list) -> bool:
+    if not value:
+        return False
+    host = str(value).strip("[]").lower()
+    if host == "localhost" or host in hosts:
+        return True
+    try:
+        address = ip_address(host)
+    except ValueError:
+        return False
+    return address.is_loopback or any(address in net for net in nets)
 
 
 def local_request(request: Request) -> bool:
     # Both the peer and Host matter: a DNS-rebinding Host or a local reverse
     # proxy does not turn an arbitrary remote page into the local workbench.
-    if request.client and request.client.host in _allowed_hosts() \
-            and (request.url.hostname or "").lower() in _allowed_hosts():
+    hosts, nets = _allowed_config()
+    client = request.client.host if request.client else None
+    url_host = (request.url.hostname or "").lower()
+    if _host_allowed(client, hosts, nets) and _host_allowed(url_host, hosts, nets):
         return True
     return bool(request.client and loopback(request.client.host)
                 and loopback(request.url.hostname or ""))
