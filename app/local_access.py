@@ -1,6 +1,7 @@
 """Lightweight boundaries for a single-user, local-only workbench. No login."""
 from __future__ import annotations
 
+import os
 from ipaddress import ip_address
 from urllib.parse import urlsplit
 
@@ -20,9 +21,19 @@ def loopback(host: str) -> bool:
         return False
 
 
+def _allowed_hosts() -> set[str]:
+    # SPK-OS patch: LAN 访问白名单（宿主机经 192.168.56.101 访问），
+    # 环境变量 CREATORHUB_ALLOWED_HOSTS 逗号分隔，未配置时保持上游 loopback-only 行为。
+    raw = os.environ.get("CREATORHUB_ALLOWED_HOSTS", "")
+    return {h.strip().strip("[]").lower() for h in raw.split(",") if h.strip()}
+
+
 def local_request(request: Request) -> bool:
     # Both the peer and Host matter: a DNS-rebinding Host or a local reverse
     # proxy does not turn an arbitrary remote page into the local workbench.
+    if request.client and request.client.host in _allowed_hosts() \
+            and (request.url.hostname or "").lower() in _allowed_hosts():
+        return True
     return bool(request.client and loopback(request.client.host)
                 and loopback(request.url.hostname or ""))
 
