@@ -2,7 +2,7 @@
 
 > 本地运行的多平台内容管理面板，支持 **抖音 / 小红书 / 快手 / 视频号**。
 
-[在线预览](https://3441293738.github.io/creatorhub/) · [快速开始](#快速开始) · [平台能力](#平台能力) · [基本使用](#基本使用) · [配置](#配置) · [常见问题](#常见问题) · [交流群](#交流群)
+[新手使用指南](https://3441293738.github.io/creatorhub/guide/) · [在线预览](https://3441293738.github.io/creatorhub/) · [快速开始](#快速开始) · [平台能力](#平台能力) · [基本使用](#基本使用) · [配置](#配置) · [常见问题](#常见问题) · [交流群](#交流群)
 
 > 在线预览由 GitHub Pages 提供，使用脱敏示例数据，仅展示界面与交互；登录、抓取、下载和发布仍需在本地运行。
 
@@ -31,7 +31,23 @@ CreatorHub 使用 Python + FastAPI 提供统一 Web 界面，用于管理账号�
 
 ## 快速开始
 
-### 环境要求
+### Windows 安装版（推荐）
+
+1. 打开 **[Windows 安装包下载页](https://github.com/3441293738/creatorhub/releases/latest)**，在 Assets 中下载 `CreatorHub-Setup-版本-windows-x64.exe`。
+2. 双击安装，使用桌面快捷方式启动。无需自行安装 Python、运行构建命令或下载源码；缺少 WebView2 时安装器会自动联网安装。
+3. 点击“启动本地服务”。首次会自动下载浏览器组件，就绪后打开工作台并登录账号。
+
+适用于 Windows 10/11 x64。安装与首次启动请保持联网。升级前先“停止并退出”，再运行新版安装包，用户数据保留。`Source code (zip)` 是源码，不是安装包；若尚无正式版本，请等待维护者完成首次发布。
+
+维护者只需推送数字版本标签（例如 `v0.1.0`），Actions 会测试、构建并发布安装包到 GitHub Releases。详细流程见 [`desktop/README.md`](desktop/README.md)。
+
+第一次使用？先看 **[图文上手指南](https://3441293738.github.io/creatorhub/guide/)**：从 ZIP 下载、安装启动、账号登录到完成第一个任务，再按需查看各功能操作与常见问题。文档源码和维护方式见 [`guide/`](guide/README.md)，随现有 GitHub Pages 工作流发布。
+
+### 源码运行（开发者 / macOS / Linux）
+
+Windows 安装版用户跳过以下环境安装与命令。
+
+#### 环境要求
 
 - Python 3.10+
 - 桌面环境（扫码登录时需要弹出浏览器）
@@ -358,14 +374,28 @@ data/
 
 欢迎加入 **CreatorHub 交流群**，交流使用经验、问题反馈和功能建议。
 
-<p align="center">
-  <a href="https://3441293738.github.io/creatorhub/community/">
-    <img src="assets/community/live-entry.png" alt="CreatorHub 交流群固定入口二维码" width="280">
-  </a>
-</p>
+<table>
+  <tr>
+    <th align="center">扫码加群</th>
+    <th align="center">添加作者微信</th>
+  </tr>
+  <tr>
+    <td align="center">
+      <a href="assets/community/wechat-group.jpg">
+        <img src="assets/community/wechat-group.jpg" alt="CreatorHub 交流群二维码" width="240">
+      </a>
+    </td>
+    <td align="center">
+      <a href="assets/community/wechat-personal.jpg">
+        <img src="assets/community/wechat-personal.jpg" alt="作者个人微信二维码，扫码添加好友" width="240">
+      </a>
+    </td>
+  </tr>
+</table>
 
 <p align="center">
-  扫码或点击二维码打开<a href="https://3441293738.github.io/creatorhub/community/">交流群固定入口</a>；微信群二维码到期后会在入口页更新。
+  使用微信扫描群二维码加入交流群，点击图片可查看原图。
+  入群遇到问题，也可以添加作者微信联系。
 </p>
 
 ## 赞助商
