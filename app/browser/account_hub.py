@@ -11,6 +11,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
@@ -311,6 +312,30 @@ async def fetch_account_works(mgr: BrowserManager, identity, platform: str, uid:
     return out, ("" if out else err)
 
 
+async def fetch_douyin_account_works_api(cookie: str, user_agent: str, uid: str,
+                                         timeout: float = 20.0,
+                                         proxy: str = "", *,
+                                         environment: dict | None = None
+                                         ) -> Tuple[List[dict], str]:
+    """读取抖音本账号作品 Web API，并归一化为 AccountWork 字段。"""
+    from ..platforms.douyin import DouyinClient
+    uid = (uid or "").strip()
+    if not uid:
+        return [], "missing_uid:账号缺自身 uid"
+    if not cookie:
+        return [], "no_cookie"
+    client = DouyinClient(
+        cookie, user_agent, timeout=timeout, proxy=proxy,
+        **(environment or {}))
+    try:
+        async with client.session_scope():
+            raw = await client.fetch_all_video_list(uid)
+    except Exception as exc:
+        return [], f"api:{type(exc).__name__}"
+    out = [w for w in (_norm_douyin_work(it) for it in raw) if w]
+    return out, ("" if out else (client.last_error or "empty"))
+
+
 # ═══════════ 关注 / 粉丝(无公开接口:拦截该账号登录态打开的关注/粉丝页 XHR) ═══════════
 _NAME_KEYS = ("nickname", "nick_name", "user_name", "userName", "name", "nick", "nickName")
 _ID_KEYS = ("user_id", "userId", "uid", "id", "red_id", "kwaiId")
@@ -557,9 +582,8 @@ _DOUYIN_STAT_PROBE_JS = """() => {
 }"""
 
 _FOLLOW_PRECISE = {
-    # follower/list 接口是活的(浏览器拦截能拿到数据),但直连拿不到:所有参数组合都是
-    # HTTP 200 + 空 body,而同一套签名下 following/list 正常。推测是假 msToken 被风控拒
-    # (未验证)。所以 fan 方向实际靠浏览器兜底,别再去调直连的参数。
+    # 浏览器回退仍按方向精确匹配接口。直连 follower/list 使用当前 a_bogus
+    # 和首屏时间游标；平台签名升级导致直连失效时，hybrid 仍可回退到这里。
     "douyin":   {"following": ("following/list",), "fan": ("follower/list",)},
     "xhs":      {"following": ("followings", "/follows"), "fan": ("fans", "/followers")},
     "kuaishou": {"following": (), "fan": ()},   # 快手走 graphql visionProfileUserList(见下)
@@ -609,6 +633,9 @@ async def fetch_follows(mgr: BrowserManager, identity, platform: str, uid: str,
     hit_urls: list = []                  # 真正吐出用户列表的接口(标定关键)
     api_seen: list = []
     error = ""
+    precise_response_seen = False
+    precise_empty_confirmed = False
+    precise_response_event = asyncio.Event()
     page = await mgr.new_page(identity, block_media=platform != "xhs")
     if platform == "xhs":
         try:
@@ -639,6 +666,7 @@ async def fetch_follows(mgr: BrowserManager, identity, platform: str, uid: str,
         return False
 
     async def on_response(resp):
+        nonlocal precise_response_seen, precise_empty_confirmed
         u = resp.url
         if host not in u or resp.request.resource_type not in ("xhr", "fetch"):
             return
@@ -656,11 +684,19 @@ async def fetch_follows(mgr: BrowserManager, identity, platform: str, uid: str,
             if any(k in body for k in ("user_name", "userName", "nickname", "headurl",
                                        "fols", "userList", "\"fan\"", "following")):
                 ks_samples.append(f"{path} => {body[:700]}")
+        precise = _is_follow_api(path.lower(), data)
+        if precise and isinstance(data, dict) and data.get("status_code") in (None, 0, "0"):
+            precise_response_seen = True
+            precise_response_event.set()
+            # 抖音列表位于顶层 followers/followings；只有看到了明确的空数组，
+            # 才能确认账号确实为 0，而不是解析器没对上新结构。
+            expected_key = "followers" if direction == "fan" else "followings"
+            if platform == "douyin" and isinstance(data.get(expected_key), list):
+                precise_empty_confirmed = len(data[expected_key]) == 0
         found: List[dict] = []
         _harvest_user_lists(data, found)
         if not found:
             return
-        precise = _is_follow_api(path.lower(), data)
         sink = collected if precise else broad
         added = 0
         for d in found:
@@ -669,7 +705,7 @@ async def fetch_follows(mgr: BrowserManager, identity, platform: str, uid: str,
                 sink[n["uid"]] = n
                 added += 1
         if added and path not in hit_urls:
-            hit_urls.append(("✓" if precise else "?") + path)
+            hit_urls.append(("exact:" if precise else "candidate:") + path)
 
     page.on("response", on_response)
     try:
@@ -725,11 +761,9 @@ async def fetch_follows(mgr: BrowserManager, identity, platform: str, uid: str,
                 await mgr.xhs_interaction.pause(0.25, 0.55)
                 opened = True
                 break
-            if precise_hints:   # 等该方向接口(following/list 或 follower/list)回包来确认
+            if precise_hints:   # 等监听器确认该方向接口；不会漏掉点击后瞬间返回的响应
                 try:
-                    await page.wait_for_response(
-                        lambda r: any(h in r.url for h in precise_hints) and r.status == 200,
-                        timeout=7000)
+                    await asyncio.wait_for(precise_response_event.wait(), timeout=7)
                     opened = True
                     break
                 except Exception:
@@ -831,7 +865,9 @@ async def fetch_follows(mgr: BrowserManager, identity, platform: str, uid: str,
         for i, smp in enumerate(ks_samples):
             print(f"[follow-ks {direction} {i}] {smp}")
     if not result:
-        if platform == "xhs":
+        if precise_empty_confirmed:
+            error = "empty"
+        elif platform == "xhs":
             # 实测三轮:点开后从不发关注/粉丝接口,页内也无该方向用户链接 ——
             # 小红书网页端不提供关注/粉丝列表(App 专属),非本项目可解。
             error = error or ("小红书网页端不提供关注/粉丝列表(该列表为 App 专属,"
@@ -1127,6 +1163,7 @@ async def fetch_dm_conversations(mgr: BrowserManager, identity, platform: str,
     ws_frames: list = []         # 抓少量 WS 帧(仅 frontier-im),看会话/消息是不是走 WS 推
     im_hit = [False]             # IM 是否真的 bootstrap(点入口后据此确认,而非只看「点了」)
     dm_init_raw = [b""]          # 抖音:get_message_by_init 的 protobuf 大包(会话全在这)
+    dm_init_request_raw = [b""]  # 对应请求体,用于离线标定/验证纯协议初始化
     im_profiles: Dict[str, dict] = {}  # uid -> {nickname, avatar, sec_uid},来自 im/user/info JSON
     error = ""
     page = await mgr.new_page(identity, block_media=platform != "xhs")
@@ -1173,6 +1210,9 @@ async def fetch_dm_conversations(mgr: BrowserManager, identity, platform: str,
             im_hit[0] = True
         # 抖音会话大包:get_message_by_init(protobuf)。留最大的一份(全量那次)。
         if platform == "douyin" and "get_message_by_init" in low:
+            request_body = resp.request.post_data_buffer or b""
+            if len(request_body) > len(dm_init_request_raw[0]):
+                dm_init_request_raw[0] = request_body
             try:
                 b = await resp.body()      # body() 内部已等 body 下完,无需 finished()
             except Exception as e:
@@ -1288,9 +1328,9 @@ async def fetch_dm_conversations(mgr: BrowserManager, identity, platform: str,
                     ".filter(o => /私信|消息|message|\\/im|im-|conversation/i.test("
                     "  [o.txt,o.href,o.aria,o.cls,o.de].join(' ')))"
                     ".slice(0,25)")
-                print(f"[dm-probe] douyin entry candidates({len(probe)}): {probe}")
+                print(f"[dm-probe] douyin entry candidates({len(probe)}): {ascii(probe)}")
             except Exception as e:
-                print(f"[dm-probe] douyin probe failed: {e!r}")
+                print(f"[dm-probe] douyin probe failed: {ascii(repr(e))}")
         # 抖音:「消息」是 <div>(无 href),React onClick 绑在祖先上,合成 element.click()
         # 不触发。改用真人式坐标点击:定位可点祖先→hover→page.mouse.click,外层容器优先,
         # 每次确认 IM 是否真的 bootstrap(im_hit);再加 JS 点祖先链兜底。
@@ -1315,7 +1355,7 @@ async def fetch_dm_conversations(mgr: BrowserManager, identity, platform: str,
                 boxes = await page.evaluate(_DOUYIN_IM_BOXES_JS)
             except Exception:
                 boxes = []
-            print(f"[dm-probe] douyin 消息 boxes({len(boxes or [])}): {boxes}")
+            print(f"[dm-probe] douyin message boxes({len(boxes or [])}): {ascii(boxes)}")
             # 嵌套的「消息」DIV 常落在同一坐标,点 3 次和点 1 次等价 —— 去重,省 10s
             seen_pt: Set[tuple] = set()
             ordered = []
@@ -1464,6 +1504,15 @@ async def fetch_dm_conversations(mgr: BrowserManager, identity, platform: str,
                 print(f"[dm-init] 已落盘 {_dump} ({len(dm_init_raw[0])} bytes)")
             except Exception as e:
                 print(f"[dm-init] 落盘失败: {e!r}")
+        _request_dump = os.environ.get("CREATORHUB_DM_REQUEST_DUMP")
+        if _request_dump and dm_init_request_raw[0]:
+            try:
+                with open(_request_dump, "wb") as f:
+                    f.write(dm_init_request_raw[0])
+                print(f"[dm-init] request saved {_request_dump} "
+                      f"({len(dm_init_request_raw[0])} bytes)")
+            except Exception as e:
+                print(f"[dm-init] request dump failed: {e!r}")
         # 抖音:会话在 get_message_by_init 的 protobuf 大包里。解会话 → 页面内批量
         # POST im/user/info(按 sec_uid,抖音自己签名)补昵称/头像 → 水合。
         if platform == "douyin" and dm_init_raw[0]:
@@ -1835,14 +1884,17 @@ async def send_dm_api(mgr: BrowserManager, identity, conv_id: str,
                                  ticket, text, cmid, stime)
         resp = await ctx.request.post(
             _SEND_URL, data=req,
-            headers={"content-type": "application/x-protobuf",
+            headers={"accept": "application/x-protobuf",
+                     "content-type": "application/x-protobuf",
                      "referer": "https://www.douyin.com/"})
         body = await resp.body()
         r = parse_send_response(body)
         print(f"[dm-send] conv={conv_id} status={resp.status} "
               f"ok={r['ok']} msg={r['msg']!r} code={r['error_code']} resp_len={len(body)}")
-        if resp.status == 200 and r["ok"]:
+        if resp.status == 200 and r["ok"] and r["cmd"] == 100:
             return True, ""
+        if resp.status == 200 and r["ok"]:
+            return False, "write_uncertain:发送回包命令不匹配"
         return False, f"发送被拒 status={resp.status} msg={r['msg']} code={r['error_code']}"
     except Exception as e:
         return False, f"发送失败: {e!r}"

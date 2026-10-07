@@ -4,6 +4,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Optional
 
+from sqlalchemy import Index
 from sqlmodel import Field, SQLModel
 
 
@@ -403,6 +404,7 @@ class KeywordCollectionContent(SQLModel, table=True):
     collected_comment_count: int = 0        # 本任务实际入库数
     media_json: str = "[]"
     xsec_token: str = ""
+    xsec_source: str = ""               # 与搜索结果令牌配套的来源
     download_status: str = "skipped"       # skipped | pending | downloading | done | failed
     local_path: str = ""
     error: str = ""
@@ -581,6 +583,13 @@ class AccountStatSnapshot(SQLModel, table=True):
 
 class FollowEdge(SQLModel, table=True):
     """关注关系一行一人。direction=following(我关注的) / fan(关注我的)。"""
+    __table_args__ = (
+        Index("ix_followedge_account_direction_id",
+              "account_id", "direction", "id"),
+        Index("ix_followedge_account_direction_uid",
+              "account_id", "direction", "uid"),
+    )
+
     id: Optional[int] = Field(default=None, primary_key=True)
     platform: str = Field(default="douyin", index=True)  # douyin | xhs | kuaishou
     account_id: int = Field(index=True)

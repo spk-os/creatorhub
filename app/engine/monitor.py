@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
 import random
@@ -26,7 +27,7 @@ from ..browser import (BrowserManager, fetch_videos, fetch_comments,
                        post_ks_comment,
                        fetch_channels_works, fetch_channels_comments,
                        fetch_channels_self_profile, post_channels_comment,
-                       fetch_account_works,
+                       fetch_account_works, fetch_douyin_account_works_api,
                        do_follow, send_dm, send_dm_api)
 from . import compose
 from ..config import Config
@@ -64,6 +65,7 @@ from ..risk import (
     RiskController,
 )
 from ..settings import get_setting
+from ..transport_matrix import douyin_client_environment, resolve_transport
 from .downloader import Downloader
 from .collection import KeywordCollector
 from .dm_automation import XhsDmAutomation
@@ -637,6 +639,18 @@ class MonitorEngine:
                    or "browser").strip().lower()
         return mode if mode in {"browser", "api"} else "browser"
 
+    def _douyin_write_mode(self) -> str:
+        """Return the selected Douyin write transport.
+
+        ``hybrid`` is API-first only for a positively rejected response.  A
+        timeout or malformed/empty successful response is non-idempotent and
+        therefore becomes an uncertain task instead of being submitted again
+        through the page.
+        """
+        mode = str(getattr(self.cfg.engine, "douyin_write_mode", "browser")
+                   or "browser").strip().lower()
+        return mode if mode in {"browser", "api", "hybrid"} else "browser"
+
     def _write_pause_error(self, account_id) -> str:
         """Return a persisted account write pause, clearing an expired one."""
         if not self.risk.policy.enabled:
@@ -686,29 +700,54 @@ class MonitorEngine:
             log.exception("idle browser session collection failed")
             return 0
 
+    def _monitor_poll_seconds(self) -> int:
+        """有启用的秒级监控时细化调度，不改变任务周期和账号限速。"""
+        with get_session() as session:
+            for model in (MonitorTarget, CommentWatch, DanmakuWatch):
+                query = select(model.id).where(
+                    model.enabled == True,  # noqa: E712
+                    model.interval_seconds > 0,
+                    model.interval_seconds % 60 != 0).limit(1)
+                if session.exec(query).first() is not None:
+                    return 1
+            if self.cfg.engine.scan_interval_seconds > 0 and self.cfg.engine.scan_interval_seconds % 60:
+                inherited = select(DanmakuWatch.id).where(
+                    DanmakuWatch.enabled == True,  # noqa: E712
+                    DanmakuWatch.interval_seconds == 0).limit(1)
+                if session.exec(inherited).first() is not None:
+                    return 1
+        return 15
+
     async def _loop(self):
+        next_maintenance_at = 0.0
         while self._running:
+            poll_seconds = 15
             try:
-                sampled_at = datetime.utcnow()
-                sampled_epoch = time.time()
-                self._prune_risk_events_if_due(sampled_at)
-                await self._collect_idle_browser_sessions(sampled_epoch)
+                maintenance_due = time.monotonic() >= next_maintenance_at
+                if maintenance_due:
+                    # 秒级读取不连带加速重试、保活或写操作队列；异常也保留等待。
+                    next_maintenance_at = time.monotonic() + 15
+                    self._prune_risk_events_if_due(datetime.utcnow())
+                    await self._collect_idle_browser_sessions(time.time())
                 await self._scan_once()
                 await self._scan_comment_watches()
                 await self._scan_danmaku_watches()
-                await self._retry_failed()
-                await self._process_risk_recovery()
-                await self._check_accounts()
-                await self._check_work_health()
-                await self._process_xhs_dm_automation()
-                await self._process_publish()
-                await self._process_comment_rules()
-                await self._process_comment_tasks()
-                await self._process_action_tasks()
-                await self._process_collection_jobs()
+                if maintenance_due:
+                    await self._retry_failed()
+                    await self._process_risk_recovery()
+                    await self._check_accounts()
+                    await self._check_work_health()
+                    await self._process_xhs_dm_automation()
+                    await self._process_publish()
+                    await self._process_comment_rules()
+                    await self._process_comment_tasks()
+                    await self._process_action_tasks()
+                    await self._process_collection_jobs()
+                    next_maintenance_at = time.monotonic() + 15
+                poll_seconds = self._monitor_poll_seconds()
             except Exception as e:
                 log.exception("scan loop error: %s", e)
-            await asyncio.sleep(15)
+            await asyncio.sleep(poll_seconds)
 
     async def poll_xhs_dm_now(self, account_id: int, *, trigger: str = "manual") -> dict:
         with get_session() as session:
@@ -1090,6 +1129,31 @@ class MonitorEngine:
                         return {"ok": False, "indeterminate": True,
                                 "error": "仅有创作者登录态，请在账号浏览器中确认；未启动直连探测"}
                     u, err = await fetch_xhs_self_profile(self.browser, identity)
+                elif platform == "douyin" and self.cfg.engine.douyin_read_mode in {"api", "hybrid"}:
+                    with get_session() as session:
+                        account = session.get(DouyinAccount, aid)
+                        sec_uid = account.sec_uid if account else ""
+                    cookie = dy_cookie_from_state(state or creator_state)
+                    if cookie and sec_uid:
+                        client = DouyinClient(
+                            cookie, identity.ua or self.cfg.engine.user_agent,
+                            timeout=self.cfg.engine.request_timeout_seconds,
+                            proxy=proxy,
+                            **douyin_client_environment(identity))
+                        try:
+                            async with client.session_scope():
+                                profile = await client.fetch_profile(sec_uid)
+                            if profile:
+                                u, err = profile, ""
+                            elif self.cfg.engine.douyin_read_mode == "api":
+                                u, err = {}, client.last_error or "empty_response"
+                        except Exception as exc:
+                            if self.cfg.engine.douyin_read_mode == "api":
+                                u, err = {}, f"api:{type(exc).__name__}"
+                    elif self.cfg.engine.douyin_read_mode == "api":
+                        u, err = {}, "no_cookie_or_sec_uid"
+                    if not u and self.cfg.engine.douyin_read_mode == "hybrid":
+                        u, err = await fetch_self_profile(self.browser, identity)
                 elif platform == "xhs" and creator_state:
                     chk = await creator_check(creator_state, proxy=proxy)
                     if chk is None:
@@ -1243,8 +1307,24 @@ class MonitorEngine:
                     if not self.risk.preflight(
                             aid, OperationKind.READ_HEAVY).allowed:
                         continue
-                    items, err = await fetch_account_works(self.browser, identity,
-                                                           platform, uid)
+                    if platform == "douyin" and self.cfg.engine.douyin_read_mode in {"api", "hybrid"}:
+                        with get_session() as s:
+                            acc_row = s.get(DouyinAccount, aid)
+                            state = (acc_row.storage_state or acc_row.creator_storage_state or "") if acc_row else ""
+                            ua = (acc_row.ua or self.cfg.engine.user_agent) if acc_row else self.cfg.engine.user_agent
+                            proxy = (acc_row.proxy or "") if acc_row else ""
+                        items, err = await fetch_douyin_account_works_api(
+                            dy_cookie_from_state(state), ua, uid,
+                            timeout=self.cfg.engine.request_timeout_seconds,
+                            proxy=proxy,
+                            environment=douyin_client_environment(identity))
+                        if not items and self.cfg.engine.douyin_read_mode == "hybrid":
+                            print(f"[dy-work-health] API 空响应({err}),回退浏览器")
+                            items, err = await fetch_account_works(
+                                self.browser, identity, platform, uid)
+                    else:
+                        items, err = await fetch_account_works(self.browser, identity,
+                                                               platform, uid)
                     if err:
                         self.risk.record_failure(aid, OperationKind.READ_HEAVY, err)
                     else:
@@ -1687,6 +1767,7 @@ class MonitorEngine:
                 briefs_raw, browser_error = await fetch_xhs_search(
                     self.browser, identity, keyword, known,
                     max_scrolls=strategy["max_scrolls"],
+                    search_sort="latest",
                     block_media=self.cfg.engine.block_media_resources,
                     keep_context=True)
                 if browser_error:
@@ -1701,7 +1782,8 @@ class MonitorEngine:
                 if browser_error:
                     error = browser_error
             elif kind == "keyword":
-                briefs_raw = await client.search_notes(keyword)
+                briefs_raw = await client.search_notes(
+                    keyword, sort="time_descending")
             else:
                 d = await client.notes_by_creator(user_id, xsec_token=xsec_token)
                 briefs_raw = d.get("notes") or []
@@ -1929,19 +2011,56 @@ class MonitorEngine:
                         return {"ok": False, "error": "账号不存在"}
                     if platform != "douyin":
                         return {"ok": False, "error": "当前仅支持抖音短视频弹幕"}
-                    if not acc.creator_storage_state:
+                    transport = resolve_transport(
+                        self.cfg, "douyin", "creator_danmaku", acc)
+                    if transport["effective_mode"] == "unavailable":
+                        return {"ok": False, "error": transport["reason"],
+                                "configured_mode": transport["configured_mode"]}
+                    mode = transport["effective_mode"]
+                    if mode == "browser" and not acc.creator_storage_state:
                         return {"ok": False, "error": "需要先完成抖音创作者登录"}
-                    identity = self.browser.identity_for(acc)
+                    state = acc.storage_state or acc.creator_storage_state or ""
+                    identity = (None if mode == "api"
+                                else self.browser.identity_for(acc))
+                    ua = acc.ua or self.cfg.engine.user_agent
+                    proxy = acc.proxy or ""
+                    direct_environment = douyin_client_environment(acc)
                     known = set(s.exec(select(DanmakuRecord.danmaku_id).where(
                         DanmakuRecord.watch_id == 0,
                         DanmakuRecord.aweme_id == item_id)).all())
-                raw, err = await fetch_creator_danmaku(
-                    self.browser, identity, known,
-                    page_url=self.cfg.engine.creator_danmaku_url,
-                    aweme_id=item_id,
-                    max_scrolls=self.cfg.engine.danmaku_max_scrolls,
-                    block_media=self.cfg.engine.block_media_resources,
-                )
+                raw, err = [], ""
+                source = "api" if mode == "api" else "browser"
+                if mode in {"api", "hybrid"}:
+                    cookie = dy_cookie_from_state(state)
+                    if not cookie:
+                        err = "api_missing_cookie"
+                    else:
+                        client = DouyinClient(
+                            cookie, ua,
+                            timeout=self.cfg.engine.request_timeout_seconds,
+                            proxy=proxy, **direct_environment)
+                        try:
+                            async with client.session_scope():
+                                raw = await client.fetch_all_danmaku(item_id)
+                            err = client.last_error or ""
+                        except Exception as exc:
+                            err = f"douyin_api_danmaku:{type(exc).__name__}"
+                    if raw or not err:
+                        source = "api"
+                if mode == "browser" or (mode == "hybrid" and err):
+                    if not acc.creator_storage_state:
+                        return {"ok": False,
+                                "error": "API 读取失败且未完成抖音创作者登录，无法回退浏览器",
+                                "source": "api", "configured_mode": mode}
+                    raw, browser_error = await fetch_creator_danmaku(
+                        self.browser, identity, known,
+                        page_url=self.cfg.engine.creator_danmaku_url,
+                        aweme_id=item_id,
+                        max_scrolls=self.cfg.engine.danmaku_max_scrolls,
+                        block_media=self.cfg.engine.block_media_resources,
+                    )
+                    source = "browser_fallback" if mode == "hybrid" else "browser"
+                    err = browser_error or err
                 fresh = [p for p in (parse_danmaku(row, item_id) for row in raw) if p]
                 added = 0
                 with get_session() as s:
@@ -1962,7 +2081,8 @@ class MonitorEngine:
                         added += 1
                     s.commit()
                 result = {"ok": bool(added or not err), "fetched": len(fresh),
-                          "added": added, "error": err}
+                          "added": added, "error": err, "source": source,
+                          "configured_mode": transport["configured_mode"]}
                 if result["ok"]:
                     self.risk.record_success(account_id, OperationKind.READ_HEAVY)
                 elif err:
@@ -2000,8 +2120,13 @@ class MonitorEngine:
             kind, mode = watch.kind, watch.mode
             aweme_id, sec_uid = watch.aweme_id, watch.sec_uid
             name = watch.title or aweme_id or (sec_uid[:12] if sec_uid else "watch")
-            identity = self.browser.anon_identity()
+            identity = None
+            direct_environment_source = None
             has_creator = False
+            creator_transport = None
+            state = ""
+            ua = self.cfg.engine.user_agent
+            proxy = ""
             if watch.account_id:
                 acc = s.get(DouyinAccount, watch.account_id)
                 if acc:
@@ -2013,9 +2138,36 @@ class MonitorEngine:
                         s.commit()
                         return {"ok": False, "new_danmaku": 0, "error": msg, "skipped": True}
                     has_creator = bool(acc.creator_storage_state)
-                    identity = self.browser.identity_for(acc)
+                    state = acc.storage_state or acc.creator_storage_state or ""
+                    ua = acc.ua or self.cfg.engine.user_agent
+                    proxy = acc.proxy or ""
+                    direct_environment_source = acc
+                    account_mode = (resolve_transport(
+                        self.cfg, "douyin", "creator_danmaku", acc)["effective_mode"]
+                        if mode == "creator" else self.cfg.engine.douyin_read_mode)
+                    if account_mode != "api":
+                        identity = self.browser.identity_for(acc)
+            if identity is None and not watch.account_id:
+                identity = self.browser.anon_identity()
 
-        if mode == "creator" and not has_creator:
+        if mode == "creator" and watch.account_id:
+            creator_transport = resolve_transport(
+                self.cfg, "douyin", "creator_danmaku", acc)
+            if creator_transport["effective_mode"] == "unavailable":
+                msg = creator_transport["reason"] or "当前创作中心弹幕通道不可用"
+                with get_session() as s:
+                    watch = s.get(DanmakuWatch, watch_id)
+                    if watch:
+                        watch.last_scan_at = datetime.utcnow()
+                        watch.last_error = msg
+                        s.add(watch)
+                        s.commit()
+                return {"ok": False, "new_danmaku": 0, "error": msg,
+                        "configured_mode": creator_transport["configured_mode"]}
+
+        if (mode == "creator" and creator_transport
+                and creator_transport["effective_mode"] == "browser"
+                and not has_creator):
             msg = "创作中心弹幕监控需要绑定已完成创作者登录的抖音账号"
             with get_session() as s:
                 watch = s.get(DanmakuWatch, watch_id)
@@ -2028,6 +2180,18 @@ class MonitorEngine:
 
         error = ""
         total_new = 0
+        api_client = None
+        direct_mode = (creator_transport["effective_mode"]
+                       if mode == "creator" and creator_transport
+                       else self.cfg.engine.douyin_read_mode)
+        if direct_mode in {"api", "hybrid"}:
+            cookie = dy_cookie_from_state(state)
+            if cookie:
+                api_client = DouyinClient(
+                    cookie, ua,
+                    timeout=self.cfg.engine.request_timeout_seconds,
+                    proxy=proxy,
+                    **douyin_client_environment(direct_environment_source or identity))
         try:
             settings = {
                 "recent_works": watch.recent_works or self.cfg.engine.danmaku_recent_works,
@@ -2067,14 +2231,74 @@ class MonitorEngine:
                         DanmakuRecord.watch_id == watch_id,
                         DanmakuRecord.aweme_id == aweme_id)).all())
                 if mode == "creator":
-                    raw, error = await fetch_creator_danmaku(
-                        self.browser, identity, known,
-                        page_url=self.cfg.engine.creator_danmaku_url,
-                        aweme_id=aweme_id,
-                        max_scrolls=settings["max_scrolls"],
-                        max_items=raw_cap,
-                        block_media=self.cfg.engine.block_media_resources,
-                    )
+                    raw, error = [], ""
+                    if api_client is not None:
+                        try:
+                            async with api_client.session_scope():
+                                raw = await api_client.fetch_all_danmaku(
+                                    aweme_id,
+                                    start_time=settings["time_start_ms"],
+                                    end_time=settings["time_end_ms"],
+                                    max_pages=max(1, min(settings["max_scrolls"], 10)))
+                            error = api_client.last_error or ""
+                        except Exception as exc:
+                            error = f"douyin_api_danmaku:{type(exc).__name__}"
+                    if direct_mode == "browser" or (direct_mode == "hybrid" and (
+                            error or api_client is None)):
+                        if not has_creator:
+                            error = (error + "; " if error else "") \
+                                + "未完成创作者登录，无法回退浏览器"
+                        else:
+                            raw, browser_error = await fetch_creator_danmaku(
+                                self.browser, identity, known,
+                                page_url=self.cfg.engine.creator_danmaku_url,
+                                aweme_id=aweme_id,
+                                max_scrolls=settings["max_scrolls"],
+                                max_items=raw_cap,
+                                block_media=self.cfg.engine.block_media_resources,
+                            )
+                            error = browser_error or error
+                    elif api_client is None and direct_mode == "api":
+                        error = "douyin_api_danmaku:no_cookie"
+                elif api_client is not None:
+                    try:
+                        async with api_client.session_scope():
+                            raw = await api_client.fetch_all_danmaku(
+                                aweme_id,
+                                start_time=settings["time_start_ms"],
+                                end_time=settings["time_end_ms"],
+                                max_pages=max(1, min(settings["max_scrolls"], 10)))
+                        if raw or not api_client.last_error:
+                            error = ""
+                        elif self.cfg.engine.douyin_read_mode == "api":
+                            error = f"douyin_api_danmaku:{api_client.last_error or 'empty_response'}"
+                        else:
+                            print(f"[dy-danmaku-watch] API 空响应({api_client.last_error}),回退浏览器")
+                            raw, error = await fetch_danmaku(
+                                self.browser, identity, aweme_id, known,
+                                max_rounds=max(1, min(settings["max_scrolls"], 2)),
+                                start_ms=settings["time_start_ms"],
+                                end_ms=settings["time_end_ms"],
+                                step_seconds=settings["probe_step_seconds"],
+                                max_points=settings["max_probe_points"],
+                                max_items=raw_cap,
+                                block_media=False)
+                    except Exception as exc:
+                        if self.cfg.engine.douyin_read_mode == "api":
+                            raw, error = [], f"douyin_api_danmaku:{type(exc).__name__}"
+                        else:
+                            print(f"[dy-danmaku-watch] API 异常({type(exc).__name__}),回退浏览器")
+                            raw, error = await fetch_danmaku(
+                                self.browser, identity, aweme_id, known,
+                                max_rounds=max(1, min(settings["max_scrolls"], 2)),
+                                start_ms=settings["time_start_ms"],
+                                end_ms=settings["time_end_ms"],
+                                step_seconds=settings["probe_step_seconds"],
+                                max_points=settings["max_probe_points"],
+                                max_items=raw_cap,
+                                block_media=False)
+                elif self.cfg.engine.douyin_read_mode == "api":
+                    raw, error = [], "douyin_api_danmaku:no_cookie"
                 else:
                     raw, error = await fetch_danmaku(
                         self.browser, identity, aweme_id, known,
@@ -2087,6 +2311,8 @@ class MonitorEngine:
                         block_media=False,
                     )
                 fresh = normalize_rows(raw, aweme_id)
+                fresh = [row for row in fresh
+                         if row.get("danmaku_id") not in known]
                 total_new = await self._ingest_danmaku(
                     watch_id, aweme_id, fresh, name, name, first_scan, source,
                     max_records_total=settings["max_records_total"])
@@ -2094,13 +2320,39 @@ class MonitorEngine:
                 with get_session() as s:
                     known = set(s.exec(select(DanmakuRecord.danmaku_id).where(
                         DanmakuRecord.watch_id == watch_id)).all())
-                raw, error = await fetch_creator_danmaku(
-                    self.browser, identity, known,
-                    page_url=self.cfg.engine.creator_danmaku_url,
-                    max_scrolls=settings["max_scrolls"],
-                    max_items=raw_cap,
-                    block_media=self.cfg.engine.block_media_resources,
-                )
+                raw, error = [], ""
+                if api_client is not None:
+                    try:
+                        async with api_client.session_scope():
+                            works = await api_client.fetch_all_video_list(sec_uid)
+                            for item in works[:settings["recent_works"]]:
+                                aid = str(item.get("aweme_id") or "")
+                                if not aid:
+                                    continue
+                                raw.extend(await api_client.fetch_all_danmaku(
+                                    aid,
+                                    start_time=settings["time_start_ms"],
+                                    end_time=settings["time_end_ms"],
+                                    max_pages=max(1, min(settings["max_scrolls"], 10))))
+                        error = api_client.last_error or ""
+                    except Exception as exc:
+                        error = f"douyin_api_danmaku:{type(exc).__name__}"
+                if direct_mode == "browser" or (direct_mode == "hybrid" and (
+                        error or api_client is None)):
+                    if not has_creator:
+                        error = (error + "; " if error else "") \
+                            + "未完成创作者登录，无法回退浏览器"
+                    else:
+                        raw, browser_error = await fetch_creator_danmaku(
+                            self.browser, identity, known,
+                            page_url=self.cfg.engine.creator_danmaku_url,
+                            max_scrolls=settings["max_scrolls"],
+                            max_items=raw_cap,
+                            block_media=self.cfg.engine.block_media_resources,
+                        )
+                        error = browser_error or error
+                elif api_client is None and direct_mode == "api":
+                    error = "douyin_api_danmaku:no_cookie"
                 grouped = {}
                 for parsed in normalize_rows(raw):
                     if parsed and parsed.get("aweme_id"):
@@ -2110,9 +2362,23 @@ class MonitorEngine:
                         watch_id, aid, fresh, name, aid, first_scan, source,
                         max_records_total=settings["max_records_total"])
             else:
-                items, _author, error = await fetch_videos(
-                    self.browser, identity, sec_uid, set(),
-                    max_scrolls=4, block_media=True)
+                items, _author, error = [], None, ""
+                if api_client is not None:
+                    try:
+                        async with api_client.session_scope():
+                            items = await api_client.fetch_all_video_list(sec_uid)
+                            _author = await api_client.fetch_profile(sec_uid)
+                        if not items and api_client.last_error:
+                            error = api_client.last_error
+                    except Exception as exc:
+                        error = f"douyin_api_works:{type(exc).__name__}"
+                if not items and self.cfg.engine.douyin_read_mode != "api":
+                    items, _author, browser_error = await fetch_videos(
+                        self.browser, identity, sec_uid, set(),
+                        max_scrolls=4, block_media=True)
+                    error = browser_error or error
+                elif not items and self.cfg.engine.douyin_read_mode == "api" and not error:
+                    error = "douyin_api_works:empty_response"
                 cutoff = int(time.time()) - settings["recent_days"] * 86400
                 works = []
                 for item in items:
@@ -2127,18 +2393,37 @@ class MonitorEngine:
                         known = set(s.exec(select(DanmakuRecord.danmaku_id).where(
                             DanmakuRecord.watch_id == watch_id,
                             DanmakuRecord.aweme_id == aid)).all())
-                    raw, item_error = await fetch_danmaku(
-                        self.browser, identity, aid, known,
-                        max_rounds=max(1, min(settings["max_scrolls"], 2)),
-                        start_ms=settings["time_start_ms"],
-                        end_ms=settings["time_end_ms"],
-                        step_seconds=settings["probe_step_seconds"],
-                        max_points=settings["max_probe_points"],
-                        max_items=raw_cap,
-                        block_media=False)
+                    raw, item_error = [], ""
+                    if api_client is not None:
+                        try:
+                            async with api_client.session_scope():
+                                raw = await api_client.fetch_all_danmaku(
+                                    aid,
+                                    start_time=settings["time_start_ms"],
+                                    end_time=settings["time_end_ms"],
+                                    max_pages=max(1, min(settings["max_scrolls"], 10)))
+                            if not raw and api_client.last_error:
+                                item_error = api_client.last_error
+                        except Exception as exc:
+                            item_error = f"douyin_api_danmaku:{type(exc).__name__}"
+                    if not raw and self.cfg.engine.douyin_read_mode != "api":
+                        raw, browser_error = await fetch_danmaku(
+                            self.browser, identity, aid, known,
+                            max_rounds=max(1, min(settings["max_scrolls"], 2)),
+                            start_ms=settings["time_start_ms"],
+                            end_ms=settings["time_end_ms"],
+                            step_seconds=settings["probe_step_seconds"],
+                            max_points=settings["max_probe_points"],
+                            max_items=raw_cap,
+                            block_media=False)
+                        item_error = browser_error or item_error
+                    elif not raw and not item_error and self.cfg.engine.douyin_read_mode == "api":
+                        item_error = "douyin_api_danmaku:empty_response"
                     if item_error and not error:
                         error = item_error
                     fresh = normalize_rows(raw, aid)
+                    fresh = [row for row in fresh
+                             if row.get("danmaku_id") not in known]
                     total_new += await self._ingest_danmaku(
                         watch_id, aid, fresh, name, desc, first_scan, source,
                         max_records_total=settings["max_records_total"])
@@ -2217,10 +2502,26 @@ class MonitorEngine:
             return {"ok": True, "fetched": 0, "added": 0, "skipped": "正在抓取中"}
         self._inflight.add(key)
         try:
-            return await self._guarded_read_dict(
+            result = await self._guarded_read_dict(
                 account_id, OperationKind.READ_HEAVY, key,
                 lambda: self._sync_work_comments_locked(
                     account_id, platform, item_id, xsec_token))
+            # A risk-deferred read used to return only ok/skipped/reason.  The
+            # work-comments UI then rendered "undefined" as a successful count.
+            # Keep one stable response contract for completed and deferred runs.
+            normalized = dict(result or {})
+            normalized.setdefault("fetched", 0)
+            normalized.setdefault("added", 0)
+            normalized.setdefault("error", "")
+            if platform == "douyin":
+                normalized.setdefault(
+                    "configured_mode",
+                    resolve_transport(
+                        self.cfg, "douyin", "own_work_comments")[
+                            "configured_mode"])
+            normalized.setdefault(
+                "source", "deferred" if normalized.get("skipped") else "unknown")
+            return normalized
         finally:
             self._inflight.discard(key)
 
@@ -2237,29 +2538,79 @@ class MonitorEngine:
             state = acc.storage_state or acc.creator_storage_state or ""
             ua = acc.ua or self.cfg.engine.user_agent
             proxy = acc.proxy or ""
-            identity = self.browser.identity_for(acc)
+            dy_transport = (resolve_transport(
+                self.cfg, "douyin", "own_work_comments", acc)
+                if platform == "douyin" else None)
+            identity = (None if dy_transport and
+                        dy_transport["effective_mode"] == "api"
+                        else self.browser.identity_for(acc))
+            direct_environment = douyin_client_environment(acc)
             known = set(s.exec(select(CommentRecord.comment_id).where(
                 CommentRecord.watch_id == 0,
                 CommentRecord.aweme_id == item_id)).all())
         fresh: list = []
         error = ""
+        source = "browser"
+        configured_mode = "browser"
         try:
             if platform == "douyin":
-                cookie = dy_cookie_from_state(state)
-                if not cookie:
-                    return {"ok": False, "error": "账号无抖音登录态 Cookie,无法直连抓评论"}
-                client = DouyinClient(cookie, ua,
-                                      timeout=self.cfg.engine.request_timeout_seconds,
-                                      proxy=proxy)
-                raw = await client.fetch_all_comments(item_id)
+                transport = dy_transport
+                configured_mode = transport["configured_mode"]
+                mode = transport["effective_mode"]
+                raw: list = []
+                api_error = ""
+                if mode in {"api", "hybrid"}:
+                    cookie = dy_cookie_from_state(state)
+                    if not cookie:
+                        api_error = "api_missing_cookie"
+                    else:
+                        client = DouyinClient(
+                            cookie, ua,
+                            timeout=self.cfg.engine.request_timeout_seconds,
+                            proxy=proxy, **direct_environment)
+                        try:
+                            async with client.session_scope():
+                                raw = await client.fetch_all_comments(item_id)
+                            api_error = client.last_error or ""
+                        except Exception as exc:
+                            api_error = f"api:{type(exc).__name__}"
+                    # A parsed response with an empty comments array is a valid
+                    # zero-comment result.  Only an explicit client error may
+                    # enter hybrid fallback.
+                    if not api_error:
+                        source = "api"
+                    elif mode == "api":
+                        return {
+                            "ok": False, "fetched": 0, "added": 0,
+                            "error": f"douyin_api_comments:{api_error}",
+                            "source": "api", "configured_mode": configured_mode,
+                        }
+                if mode == "browser" or (mode == "hybrid" and api_error):
+                    raw, browser_error = await fetch_comments(
+                        self.browser, identity, item_id, known,
+                        max_scrolls=self.cfg.engine.comment_max_scrolls,
+                        block_media=self.cfg.engine.block_media_resources)
+                    source = "browser_fallback" if mode == "hybrid" else "browser"
+                    error = browser_error or ""
+                    if error and not raw:
+                        return {
+                            "ok": False, "fetched": 0, "added": 0,
+                            "error": error, "source": source,
+                            "configured_mode": configured_mode,
+                        }
                 fresh = [c for c in (parse_comment(rc) for rc in raw)
                          if c and c["comment_id"] not in known]
             elif platform == "xhs":
+                source = "api"
+                configured_mode = "api"
                 client = self._xhs_client(identity, state, proxy)
                 if client is None:
-                    return {"ok": False, "error": "小红书账号缺 a1 Cookie,无法抓评论"}
+                    return {"ok": False, "fetched": 0, "added": 0,
+                            "error": "小红书账号缺 a1 Cookie,无法抓评论",
+                            "source": source, "configured_mode": configured_mode}
                 fresh = await self._xhs_fetch_comments(client, item_id, xsec_token, known)
             elif platform == "kuaishou":
+                source = configured_mode = "browser"
                 raw, err = await fetch_ks_comments(
                     self.browser, identity, item_id, known,
                     max_scrolls=self.cfg.engine.comment_max_scrolls,
@@ -2268,6 +2619,7 @@ class MonitorEngine:
                 fresh = [c for c in (parse_ks_comment(rc) for rc in flatten_ks_comments(raw))
                          if c and c["comment_id"] not in known]
             elif platform == "shipinhao":
+                source = configured_mode = "browser"
                 raw, err = await fetch_channels_comments(
                     self.browser, identity, item_id, known,
                     max_scrolls=self.cfg.engine.comment_max_scrolls,
@@ -2277,7 +2629,9 @@ class MonitorEngine:
                                      for rc in flatten_channels_comments(raw))
                          if c and c["comment_id"] not in known]
             else:
-                return {"ok": False, "error": f"不支持的平台:{platform}"}
+                return {"ok": False, "fetched": 0, "added": 0,
+                        "error": f"不支持的平台:{platform}",
+                        "source": "unavailable", "configured_mode": "unavailable"}
         except XhsApiError as e:
             error = e
         except Exception as e:
@@ -2286,7 +2640,9 @@ class MonitorEngine:
             error = (e if category in {
                 RiskCategory.RISK, RiskCategory.AUTH, RiskCategory.NETWORK
             } else repr(e))
-            return {"ok": False, "error": error}
+            return {"ok": False, "fetched": 0, "added": 0,
+                    "error": error, "source": source,
+                    "configured_mode": configured_mode}
         # 去重落库(watch_id=0 = 本账号作品来源)
         added = 0
         with get_session() as s:
@@ -2304,7 +2660,8 @@ class MonitorEngine:
                 added += 1
             s.commit()
         return {"ok": not error or added > 0, "fetched": len(fresh),
-                "added": added, "error": error}
+                "added": added, "error": error, "source": source,
+                "configured_mode": configured_mode}
 
     async def fetch_douyin_follows_direct(self, account_id: int, direction: str):
         return await self.guarded_read_pair(
@@ -2314,7 +2671,8 @@ class MonitorEngine:
                 account_id, direction),
             empty_result=[])
 
-    async def _fetch_douyin_follows_direct_locked(self, account_id: int, direction: str):
+    async def _fetch_douyin_follows_direct_locked(
+            self, account_id: int, direction: str, progress=None):
         """抖音关注/粉丝直连(following/follower list 分页,比弹窗滚动抓得全)。
         返回 (归一用户列表, error);拿不到时上层回退浏览器拦截,故失败无副作用。"""
         from ..browser.account_hub import _norm_follow_user
@@ -2330,24 +2688,41 @@ class MonitorEngine:
             ua = acc.ua or self.cfg.engine.user_agent
             proxy = acc.proxy or ""
             sec_uid = acc.sec_uid or ""
+            direct_environment = douyin_client_environment(acc)
         cookie = dy_cookie_from_state(state)
         if not cookie:
             return [], "no_cookie"
         client = DouyinClient(cookie, ua,
                               timeout=self.cfg.engine.request_timeout_seconds,
-                              proxy=proxy)
+                              proxy=proxy, **direct_environment)
+        out = []
+
+        async def receive_page(rows: list[dict], meta: dict):
+            for row in rows:
+                normalized = _norm_follow_user(row, direction)
+                if normalized:
+                    out.append(normalized)
+            if progress is not None:
+                update = dict(meta)
+                update["fetched"] = len(out)
+                result = progress(update)
+                if inspect.isawaitable(result):
+                    await result
+
         try:
-            raw = await client.fetch_all_follows("", sec_uid, direction)
+            async with client.session_scope():
+                await client.fetch_all_follows(
+                    "", sec_uid, direction, on_page=receive_page,
+                    collect=False)
         except Exception as e:
             return [], repr(e)
-        out = []
-        for u in raw:
-            n = _norm_follow_user(u, direction)
-            if n:
-                out.append(n)
-        print(f"[follow-direct] dir={direction} sec_uid={sec_uid} raw={len(raw)} "
-              f"norm={len(out)}")
-        return out, ("" if out else "empty")
+        meta = getattr(client, "last_follow_meta", {})
+        print(f"[follow-direct] dir={direction} sec_uid={sec_uid} "
+              f"pages={meta.get('pages', 0)} norm={len(out)} "
+              f"complete={meta.get('complete', False)}")
+        # HTTP 200 + 空 body、非法 JSON 等是传输/风控失败，不是“有效空列表”。
+        # 保留 DouyinClient 的分类，让上层决定是否回退浏览器且不清空旧快照。
+        return out, (client.last_error or ("" if out else "empty"))
 
     async def scan_comment_watch(self, watch_id: int) -> dict:
         key = f"cw:{watch_id}"
@@ -2376,6 +2751,7 @@ class MonitorEngine:
             xsec_token = w.xsec_token or ""
             name = w.title or aweme_id or (sec_uid[:12] if sec_uid else "watch")
             state = creator_state = proxy = ""
+            ua = self.cfg.engine.user_agent
             identity = self.browser.anon_identity()
             has_creator = False
             if w.account_id:
@@ -2389,11 +2765,25 @@ class MonitorEngine:
                             w2.last_error = msg
                             s.add(w2); s.commit()
                         return {"ok": False, "new_comments": 0, "error": msg, "skipped": True}
-                    state = acc.storage_state or ""
+                    state = acc.storage_state or acc.creator_storage_state or ""
                     creator_state = acc.creator_storage_state or ""
+                    ua = acc.ua or self.cfg.engine.user_agent
                     proxy = acc.proxy or ""
                     has_creator = bool(creator_state)
                     identity = self.browser.identity_for(acc)
+
+        # 公开抖音读取可复用一个带 Cookie 的 Web API 会话；创作中心仍由
+        # 浏览器处理。没有登录态时 hybrid 继续允许匿名浏览器回退。
+        api_client = None
+        if (platform == "douyin" and mode == "public"
+                and self.cfg.engine.douyin_read_mode in {"api", "hybrid"}):
+            cookie = dy_cookie_from_state(state)
+            if cookie:
+                api_client = DouyinClient(
+                    cookie, ua,
+                    timeout=self.cfg.engine.request_timeout_seconds,
+                    proxy=proxy,
+                    **douyin_client_environment(identity))
 
         error = ""
         total_new = 0
@@ -2426,11 +2816,13 @@ class MonitorEngine:
                 total_new, author = await self._cw_creator(watch_id, identity, has_creator,
                                                            name, first_scan)
             elif kind == "user":
-                total_new, author = await self._cw_user_public(watch_id, identity, sec_uid,
-                                                               name, first_scan)
+                total_new, author = await self._cw_user_public(
+                    watch_id, identity, sec_uid, name, first_scan,
+                    api_client=api_client)
             else:  # video
-                total_new, author = await self._cw_video(watch_id, identity, aweme_id,
-                                                         name, first_scan)
+                total_new, author = await self._cw_video(
+                    watch_id, identity, aweme_id, name, first_scan,
+                    api_client=api_client)
         except XhsApiError as e:
             error = e
         except Exception as e:
@@ -2488,28 +2880,75 @@ class MonitorEngine:
                                 or cfg.comment_max_scrolls),
             }
 
-    async def _cw_video(self, watch_id, identity, aweme_id, name, first_scan):
+    async def _cw_video(self, watch_id, identity, aweme_id, name, first_scan,
+                        api_client=None, work_desc=""):
         cfg = self.cfg.engine
         settings = self._comment_watch_settings(watch_id)
         with get_session() as s:
             known = set(s.exec(select(CommentRecord.comment_id)
                                .where(CommentRecord.watch_id == watch_id)
                                .where(CommentRecord.aweme_id == aweme_id)).all())
-        raw, err = await fetch_comments(self.browser, identity, aweme_id, known,
-                                        max_scrolls=settings["max_scrolls"],
-                                        block_media=cfg.block_media_resources)
+        raw, err = [], ""
+        if api_client is not None and cfg.douyin_read_mode in {"api", "hybrid"}:
+            try:
+                async with api_client.session_scope():
+                    raw = await api_client.fetch_all_comments(aweme_id)
+                fresh = [c for c in (parse_comment(rc) for rc in raw)
+                         if c and c["comment_id"] not in known]
+                # 非空响应即使全部是已知评论也代表 API 成功，不应重复打开浏览器。
+                if raw or not api_client.last_error:
+                    return (await self._ingest(
+                        watch_id, aweme_id, fresh, name, work_desc or name,
+                        first_scan), None)
+                err = api_client.last_error or "empty_response"
+                if cfg.douyin_read_mode == "api":
+                    raise RuntimeError(f"douyin_api_comments:{err}")
+                print(f"[dy-comment-watch] API 空响应({err}),回退浏览器")
+            except Exception as exc:
+                err = f"api:{type(exc).__name__}"
+                if cfg.douyin_read_mode == "api":
+                    log.info("评论监控(视频)API 失败 %s: %s", aweme_id, exc)
+                    raise
+        elif cfg.douyin_read_mode == "api":
+            raise RuntimeError("douyin_api_comments:no_cookie")
+        raw, browser_err = await fetch_comments(
+            self.browser, identity, aweme_id, known,
+            max_scrolls=settings["max_scrolls"],
+            block_media=cfg.block_media_resources)
+        err = browser_err or err
         if err:
             log.info("评论监控(视频)%s: %s", aweme_id, err)
         fresh = [c for c in (parse_comment(rc) for rc in raw) if c]
-        n = await self._ingest(watch_id, aweme_id, fresh, name, name, first_scan)
+        n = await self._ingest(watch_id, aweme_id, fresh, name,
+                               work_desc or name, first_scan)
         return n, None
 
-    async def _cw_user_public(self, watch_id, identity, sec_uid, name, first_scan):
+    async def _cw_user_public(self, watch_id, identity, sec_uid, name, first_scan,
+                              api_client=None):
         cfg = self.cfg.engine
         settings = self._comment_watch_settings(watch_id)
-        items, author, err = await fetch_videos(self.browser, identity, sec_uid, set(),
-                                                max_scrolls=4,
-                                                block_media=cfg.block_media_resources)
+        items, author, err = [], None, ""
+        if api_client is not None and cfg.douyin_read_mode in {"api", "hybrid"}:
+            try:
+                async with api_client.session_scope():
+                    items = await api_client.fetch_all_video_list(sec_uid)
+                    author = await api_client.fetch_profile(sec_uid)
+                if not items:
+                    err = api_client.last_error or "empty_response"
+                if not items and cfg.douyin_read_mode == "hybrid":
+                    print(f"[dy-comment-watch] API 作品空响应({err}),回退浏览器")
+            except Exception as exc:
+                err = f"api:{type(exc).__name__}"
+                if cfg.douyin_read_mode == "api":
+                    log.info("评论监控(账号)API 失败 %s: %s", sec_uid, exc)
+                    raise
+        if not items and cfg.douyin_read_mode != "api":
+            items, author, browser_err = await fetch_videos(
+                self.browser, identity, sec_uid, set(), max_scrolls=4,
+                block_media=cfg.block_media_resources)
+            err = browser_err or err
+        elif not items and err and cfg.douyin_read_mode == "api":
+            raise RuntimeError(f"douyin_api_works:{err}")
         if err:
             log.info("评论监控(账号)%s: %s", sec_uid, err)
         cutoff = int(time.time()) - settings["recent_days"] * 86400
@@ -2517,7 +2956,7 @@ class MonitorEngine:
         for it in items:
             aid = str(it.get("aweme_id") or "")
             ct = int(it.get("create_time") or 0)
-            if aid and ct >= cutoff:
+            if aid and (not cutoff or not ct or ct >= cutoff):
                 works.append((aid, (it.get("desc") or "")))
         works = works[:settings["recent_works"]]
         total = 0
@@ -2526,11 +2965,10 @@ class MonitorEngine:
                 known = set(s.exec(select(CommentRecord.comment_id)
                                    .where(CommentRecord.watch_id == watch_id)
                                    .where(CommentRecord.aweme_id == aid)).all())
-            raw, _e = await fetch_comments(self.browser, identity, aid, known,
-                                           max_scrolls=settings["max_scrolls"],
-                                           block_media=cfg.block_media_resources)
-            fresh = [c for c in (parse_comment(rc) for rc in raw) if c]
-            total += await self._ingest(watch_id, aid, fresh, name, desc, first_scan)
+            n, _ = await self._cw_video(
+                watch_id, identity, aid, name, first_scan,
+                api_client=api_client, work_desc=desc)
+            total += n
         return total, author
 
     # ── 快手评论监控(浏览器拦截 GraphQL)──
@@ -2877,8 +3315,14 @@ class MonitorEngine:
                 self._defer_row(t, "账号代理当前不可用", fallback_seconds=300)
                 s.add(t); s.commit()
                 return {"ok": False, "error": "proxy unavailable"}
+            platform = t.platform
+            dy_publish_transport = (resolve_transport(
+                self.cfg, "douyin", "publish", acc)
+                if platform == "douyin" else None)
+            api_only = bool(dy_publish_transport and
+                            dy_publish_transport["configured_mode"] == "api")
             environment_error = self._native_write_environment_error(
-                acc, headed=True, browser_mode=True)
+                acc, headed=not api_only, browser_mode=not api_only)
             if environment_error:
                 self._defer_row(t, environment_error, fallback_seconds=300)
                 s.add(t); s.commit()
@@ -2903,7 +3347,9 @@ class MonitorEngine:
             # 发布用创作平台态;一次扫码已把创作 cookie 并入 storage_state,故回退它
             state = acc.creator_storage_state or acc.storage_state or ""
             native_mode = acc.identity_mode == "native"
-            identity = self.browser.identity_for(acc)
+            identity = (None if dy_publish_transport and
+                        dy_publish_transport["effective_mode"] == "unavailable"
+                        else self.browser.identity_for(acc))
             media_type, title, desc, topics = t.media_type, t.title, t.desc, t.topics
             visibility, allow_save = t.visibility, t.allow_save
             location = getattr(t, "location", "") or ""
@@ -2912,6 +3358,12 @@ class MonitorEngine:
             t.status = "publishing"; t.error = ""
             self._clear_row_block(t)
             s.add(t); s.commit()
+
+        if (dy_publish_transport is not None
+                and dy_publish_transport["effective_mode"] == "unavailable"):
+            return await self._finish_publish(
+                task_id, False, "", dy_publish_transport["reason"],
+                platform="douyin")
 
         if platform == "kuaishou":
             # 快手发布:登录态在该账号持久 profile 里(creator/storage 任一即可),走浏览器自动化
@@ -3729,8 +4181,13 @@ class MonitorEngine:
                 self._defer_row(t, "账号代理当前不可用", fallback_seconds=300)
                 s.add(t); s.commit()
                 return {"ok": False, "error": "proxy unavailable"}
-            environment_error = self._native_write_environment_error(
-                acc, headed=True, browser_mode=True)
+            platform = t.platform
+            dy_write_mode = (self._douyin_write_mode()
+                             if platform == "douyin" else "browser")
+            api_only = platform == "douyin" and dy_write_mode == "api"
+            environment_error = ("" if api_only else
+                                 self._native_write_environment_error(
+                                     acc, headed=True, browser_mode=True))
             if environment_error:
                 self._defer_row(t, environment_error, fallback_seconds=300)
                 s.add(t); s.commit()
@@ -3751,63 +4208,274 @@ class MonitorEngine:
                 return {"ok": False, "error": gate_error}
             action = t.action
             target_uid, target_sec_uid, content = t.target_uid, t.target_sec_uid, t.content
-            platform = t.platform
-            # 抖音发私信优先走无头 API(imapi/send):取会话的 short_id+ticket
+            state = acc.storage_state or acc.creator_storage_state or ""
+            ua = acc.ua or self.cfg.engine.user_agent
+            proxy = acc.proxy or ""
+            direct_environment = douyin_client_environment(acc)
+            # 先复用本地会话；没有会话时，API 分支会解析双方数字 uid 后建会。
             dm_conv_id, dm_short_id, dm_ticket = t.conv_id, "", ""
-            if action == "send_dm" and platform == "douyin" and t.conv_id:
-                _conv = s.exec(select(DmConversation).where(
+            dm_self_uid, dm_self_sec_uid = acc.uid or "", acc.sec_uid or ""
+            dm_target_nick = t.target_nick or ""
+            if action == "send_dm" and platform == "douyin":
+                _convs = s.exec(select(DmConversation).where(
                     DmConversation.account_id == t.account_id,
-                    DmConversation.conv_id == t.conv_id)).first()
+                    DmConversation.platform == "douyin")).all()
+                _conv = next((c for c in _convs if t.conv_id
+                              and c.conv_id == t.conv_id), None)
+                if _conv is None and target_uid:
+                    _conv = next((c for c in _convs
+                                  if c.peer_uid == target_uid), None)
+                if _conv is None and target_sec_uid:
+                    _conv = next((c for c in _convs
+                                  if c.peer_sec_uid == target_sec_uid), None)
                 if _conv:
+                    dm_conv_id = _conv.conv_id
                     dm_short_id, dm_ticket = _conv.conv_short_id, _conv.ticket
+                    target_uid = target_uid or _conv.peer_uid
+                    target_sec_uid = target_sec_uid or _conv.peer_sec_uid
+                    dm_target_nick = dm_target_nick or _conv.peer_nickname
             # commit 会 expire 本 session 内的实例,先把所需原语取出来再 commit
             native_mode = acc.identity_mode == "native"
-            identity = self.browser.identity_for(acc)
-            t.status = "doing"; t.method = "browser"; t.error = ""
+            # 纯 API 模式不需要构造浏览器身份；hybrid/browser 只有在
+            # 页面写入或明确拒绝后的回退路径才建立账号浏览器上下文。
+            identity = None if api_only else self.browser.identity_for(acc)
+            t.status = "doing"; t.method = ("api" if api_only else "browser"); t.error = ""
             self._clear_row_block(t)
             s.add(t); s.commit()
 
-        try:
+        async def _browser_action() -> tuple[bool, str, str]:
+            """Original page route; kept as the only hybrid fallback."""
             if action == "follow":
                 ok, err = await do_follow(self.browser, identity, platform,
                                           target_uid, target_sec_uid)
-            elif action == "unfollow":
+                return ok, err, "browser"
+            if action == "unfollow":
                 ok, err = await do_follow(self.browser, identity, platform,
                                           target_uid, target_sec_uid, unfollow=True)
-            elif action == "send_dm":
-                # 抖音:有会话信息就走无头 API 发送;失败或缺信息再回退 UI 自动化
+                return ok, err, "browser"
+            if action == "send_dm":
+                # Preserve the pre-existing browser-context imapi route when
+                # browser mode is selected, then fall back to the visible page.
                 if (platform == "douyin" and not native_mode
                         and dm_conv_id and dm_short_id and dm_ticket):
-                    ok, err = await send_dm_api(self.browser, identity, dm_conv_id,
-                                                dm_short_id, dm_ticket, content)
+                    ok, err = await send_dm_api(
+                        self.browser, identity, dm_conv_id, dm_short_id,
+                        dm_ticket, content)
+                    if ok:
+                        return True, "", "api_browser_context"
                     category, _signal = classify_platform_error(err)
-                    if not ok and category == RiskCategory.BUSINESS:
-                        ok, err = await send_dm(self.browser, identity, platform,
-                                                target_uid, target_sec_uid, content)
+                    if category != RiskCategory.BUSINESS:
+                        return False, err, "api_browser_context"
+                if platform == "xhs":
+                    ok, err = await send_dm(
+                        self.browser, identity, platform,
+                        target_uid, target_sec_uid, content,
+                        on_submit=lambda: self._mark_write_submit(
+                            AccountActionTask, task_id),
+                    )
                 else:
-                    if platform == "xhs":
-                        ok, err = await send_dm(
-                            self.browser, identity, platform,
-                            target_uid, target_sec_uid, content,
-                            on_submit=lambda: self._mark_write_submit(
-                                AccountActionTask, task_id),
-                        )
-                    else:
-                        ok, err = await send_dm(
-                            self.browser, identity, platform,
-                            target_uid, target_sec_uid, content)
+                    ok, err = await send_dm(
+                        self.browser, identity, platform,
+                        target_uid, target_sec_uid, content)
+                return ok, err, "browser"
+            return False, f"未知动作 {action}", "browser"
+
+        def _store_dm_conversation(row: dict, peer_uid: str,
+                                   peer_sec_uid: str, peer_nickname: str,
+                                   self_uid: str) -> None:
+            """建会成功后先落库；后续发送结果不影响会话标识的保存。"""
+            conv_id = str(row.get("conv_id") or "")
+            if not conv_id:
+                return
+            now = datetime.utcnow()
+            with get_session() as session:
+                conv = session.exec(select(DmConversation).where(
+                    DmConversation.account_id == account_id,
+                    DmConversation.conv_id == conv_id)).first()
+                if conv is None:
+                    conv = DmConversation(
+                        platform="douyin", account_id=account_id,
+                        conv_id=conv_id)
+                conv.peer_uid = str(peer_uid or conv.peer_uid or "")
+                conv.peer_sec_uid = str(peer_sec_uid or conv.peer_sec_uid or "")
+                conv.peer_nickname = str(
+                    peer_nickname or conv.peer_nickname or "")
+                conv.conv_short_id = str(row.get("conv_short_id") or "")
+                conv.ticket = str(row.get("ticket") or "")
+                if row.get("last_text") is not None:
+                    conv.last_text = str(row.get("last_text") or "")
+                if row.get("last_time"):
+                    conv.last_time = int(row["last_time"])
+                raw = _loads(conv.raw_json)
+                raw["self_uid"] = str(self_uid or raw.get("self_uid") or "")
+                raw["conversation_type"] = int(row.get("conv_type") or 1)
+                conv.raw_json = json.dumps(raw, ensure_ascii=False)
+                conv.fetched_at = now
+                session.add(conv)
+                task = session.get(AccountActionTask, task_id)
+                if task:
+                    task.conv_id = conv_id
+                    task.target_uid = str(peer_uid or task.target_uid or "")
+                    task.target_sec_uid = str(
+                        peer_sec_uid or task.target_sec_uid or "")
+                    task.target_nick = str(
+                        peer_nickname or task.target_nick or "")
+                    session.add(task)
+                account = session.get(DouyinAccount, account_id)
+                if account and self_uid and not account.uid:
+                    account.uid = str(self_uid)
+                    session.add(account)
+                session.commit()
+
+        def _conversation_match(rows: list[dict], *, conv_id: str,
+                                peer_uid: str, peer_sec_uid: str):
+            if conv_id:
+                found = next((row for row in rows
+                              if str(row.get("conv_id") or "") == conv_id), None)
+                if found:
+                    return found
+            if peer_uid:
+                found = next((row for row in rows
+                              if str(row.get("peer_uid") or "") == peer_uid), None)
+                if found:
+                    return found
+            if peer_sec_uid:
+                return next((row for row in rows
+                             if str(row.get("peer_sec_uid") or "") == peer_sec_uid), None)
+            return None
+
+        async def _send_new_or_existing_dm(client) -> tuple[bool, str]:
+            nonlocal target_uid, target_sec_uid, dm_self_uid, dm_self_sec_uid
+            nonlocal dm_conv_id, dm_short_id, dm_ticket, dm_target_nick
+
+            if dm_conv_id and dm_short_id and dm_ticket:
+                _store_dm_conversation({
+                    "conv_id": dm_conv_id,
+                    "conv_short_id": dm_short_id,
+                    "ticket": dm_ticket,
+                    "conv_type": 1,
+                }, target_uid, target_sec_uid, dm_target_nick, dm_self_uid)
+                return await client.send_dm(
+                    dm_conv_id, dm_short_id, dm_ticket, content)
+
+            if dm_conv_id:
+                # An existing conversation does not need either participant UID.
+                # Recover missing send credentials from the current snapshot first.
+                rows = await client.fetch_dm_conversations()
+                conversation = _conversation_match(
+                    rows, conv_id=dm_conv_id, peer_uid=target_uid,
+                    peer_sec_uid=target_sec_uid)
+                if conversation is None:
+                    return False, (client.last_error
+                                   or "已有会话缺 short_id/ticket，同步后仍未找到")
+                dm_conv_id = str(conversation.get("conv_id") or "")
+                dm_short_id = str(conversation.get("conv_short_id") or "")
+                dm_ticket = str(conversation.get("ticket") or "")
+                target_uid = str(conversation.get("peer_uid") or target_uid)
+                target_sec_uid = str(
+                    conversation.get("peer_sec_uid") or target_sec_uid)
+                _store_dm_conversation(
+                    conversation, target_uid, target_sec_uid,
+                    str(conversation.get("peer_nickname") or dm_target_nick),
+                    dm_self_uid)
+                return await client.send_dm(
+                    dm_conv_id, dm_short_id, dm_ticket, content)
+
+            if target_uid and not target_sec_uid:
+                profile, resolve_error = await client.resolve_user_identifier(
+                    target_uid)
+                if profile is None:
+                    return False, f"target_resolution_failed:{resolve_error}"
+                target_uid = str(profile.get("uid") or "")
+                target_sec_uid = str(profile.get("sec_uid") or "")
+                dm_target_nick = str(profile.get("nickname")
+                                     or dm_target_nick)
+            if not target_uid.isdigit() and target_sec_uid:
+                profile = await client.fetch_profile(target_sec_uid)
+                target_uid = str((profile or {}).get("uid")
+                                 or (profile or {}).get("user_id") or "")
+                dm_target_nick = str((profile or {}).get("nickname")
+                                     or dm_target_nick)
+            if not target_uid.isdigit():
+                return False, "缺少目标数字 uid，且无法由 sec_uid 解析"
+
+            if not dm_self_uid.isdigit():
+                profile = (await client.fetch_profile(dm_self_sec_uid)
+                           if dm_self_sec_uid else await client.fetch_self_profile())
+                dm_self_uid = str((profile or {}).get("uid")
+                                  or (profile or {}).get("user_id") or "")
+                dm_self_sec_uid = str((profile or {}).get("sec_uid")
+                                      or dm_self_sec_uid)
+            if not dm_self_uid.isdigit():
+                return False, "缺少当前账号数字 uid，且无法从账号资料解析"
+
+            conversation, create_error = await client.create_dm_conversation(
+                target_uid, dm_self_uid, target_sec_uid=target_sec_uid)
+            if conversation is None and str(create_error).startswith(
+                    "write_uncertain:"):
+                # 建会请求可能已落库：先同步确认，绝不直接重放 cmd=609。
+                rows = await client.fetch_dm_conversations()
+                conversation = _conversation_match(
+                    rows, conv_id="", peer_uid=target_uid,
+                    peer_sec_uid=target_sec_uid)
+                if conversation is None:
+                    return False, create_error
+            elif conversation is None:
+                return False, create_error
+
+            if conversation is not None:
+                dm_conv_id = str(conversation.get("conv_id") or "")
+                dm_short_id = str(conversation.get("conv_short_id") or "")
+                dm_ticket = str(conversation.get("ticket") or "")
+                _store_dm_conversation(
+                    conversation, target_uid, target_sec_uid,
+                    str(conversation.get("peer_nickname") or dm_target_nick),
+                    dm_self_uid)
+
+            return await client.send_dm(
+                dm_conv_id, dm_short_id, dm_ticket, content)
+
+        method = "browser"
+        try:
+            if platform == "douyin" and dy_write_mode in {"api", "hybrid"}:
+                method = "api"
+                cookie = dy_cookie_from_state(state)
+                if not cookie:
+                    ok, err = False, "api_missing_cookie"
+                else:
+                    client = DouyinClient(
+                        cookie, ua,
+                        timeout=self.cfg.engine.request_timeout_seconds,
+                        proxy=proxy,
+                        **direct_environment)
+                    async with client.session_scope():
+                        if action == "follow":
+                            ok, err = await client.set_follow_state(
+                                target_uid, target_sec_uid)
+                        elif action == "unfollow":
+                            ok, err = await client.set_follow_state(
+                                target_uid, target_sec_uid, unfollow=True)
+                        elif action == "send_dm":
+                            ok, err = await _send_new_or_existing_dm(client)
+                        else:
+                            ok, err = False, f"未知动作 {action}"
+                # A known rejection has a response and can fall back; an
+                # ambiguous request is deliberately not submitted twice.
+                if (not ok and dy_write_mode == "hybrid"
+                        and not str(err or "").startswith((
+                            "write_uncertain:", "target_resolution_failed:"))):
+                    category, _signal = classify_platform_error(err)
+                    if category == RiskCategory.BUSINESS:
+                        ok, err, method = await _browser_action()
+                        method = ("browser_fallback"
+                                  if method == "browser" else method)
             else:
-                ok, err = False, f"未知动作 {action}"
+                ok, err, method = await _browser_action()
         except Exception as e:
-            ok, err = False, f"{e!r}"
+            ok, err = False, (str(e) or f"{e!r}")
 
         kind = OperationKind.DM if action == "send_dm" else OperationKind.SOCIAL
-        uncertain = (
-            not ok
-            and platform == "xhs"
-            and action == "send_dm"
-            and str(err or "").startswith("write_uncertain:")
-        )
+        uncertain = not ok and str(err or "").startswith("write_uncertain:")
         failure = None if ok or uncertain else self.risk.record_failure(
             account_id, kind, err)
         with get_session() as s:
@@ -3828,6 +4496,7 @@ class MonitorEngine:
                     t.status = "failed"
                 t.error = "" if ok else err
                 t.result = "ok" if ok else ""
+                t.method = method
                 t.done_at = datetime.utcnow() if ok else t.done_at
                 s.add(t); s.commit()
                 if ok and action in ("follow", "unfollow"):
@@ -3871,7 +4540,7 @@ class MonitorEngine:
                     s.commit()
         if ok and account_id:
             self.risk.record_success(account_id, kind)
-        return {"ok": ok, "error": "" if ok else err}
+        return {"ok": ok, "error": "" if ok else err, "method": method}
 
     async def execute_comment_task(self, task_id: int) -> dict:
         if task_id in self._commenting:
@@ -3926,8 +4595,12 @@ class MonitorEngine:
                 self._defer_row(t, "账号代理当前不可用", fallback_seconds=300)
                 s.add(t); s.commit()
                 return {"ok": False, "error": "proxy unavailable"}
-            environment_error = self._native_write_environment_error(
-                acc, headed=True, browser_mode=True)
+            dy_write_mode = (self._douyin_write_mode()
+                             if platform == "douyin" else "browser")
+            api_only = platform == "douyin" and dy_write_mode == "api"
+            environment_error = ("" if api_only else
+                                 self._native_write_environment_error(
+                                     acc, headed=True, browser_mode=True))
             if environment_error:
                 self._defer_row(t, environment_error, fallback_seconds=300)
                 s.add(t); s.commit()
@@ -3945,8 +4618,11 @@ class MonitorEngine:
                 return {"ok": False, "error": gate_error}
             state = acc.storage_state or acc.creator_storage_state or ""
             proxy = acc.proxy or ""
+            ua = acc.ua or self.cfg.engine.user_agent
+            direct_environment = douyin_client_environment(acc)
             native_mode = acc.identity_mode == "native"
-            identity = self.browser.identity_for(acc)
+            # API-only 评论不启动账号浏览器；hybrid/browser 保留页面回退所需身份。
+            identity = None if api_only else self.browser.identity_for(acc)
             t.status = "doing"; t.error = ""
             self._clear_row_block(t)
             s.add(t); s.commit()
@@ -3999,6 +4675,32 @@ class MonitorEngine:
                     headed=(True if native_mode
                             else self.cfg.engine.comment_browser_headed))
                 result = "ok" if ok else ""
+            elif platform == "douyin" and dy_write_mode in {"api", "hybrid"}:
+                method = "api"
+                cookie = dy_cookie_from_state(state)
+                if not cookie:
+                    ok, err = False, "api_missing_cookie"
+                else:
+                    client = DouyinClient(
+                        cookie, ua,
+                        timeout=self.cfg.engine.request_timeout_seconds,
+                        proxy=proxy,
+                        **direct_environment)
+                    async with client.session_scope():
+                        ok, result, err = await client.post_comment(
+                            aweme_id, content, reply_comment_id=target_cid)
+                # Only a response that clearly rejected the POST may enter the
+                # browser fallback. Unknown request outcome remains uncertain.
+                if (not ok and dy_write_mode == "hybrid"
+                        and not str(err or "").startswith("write_uncertain:")):
+                    ok, err = await post_comment_browser(
+                        self.browser, identity, aweme_id, content,
+                        reply_to_text=target_text if target_cid else "",
+                        require_reply=bool(target_cid),
+                        headed=(True if native_mode
+                                else self.cfg.engine.comment_browser_headed))
+                    method = "browser_fallback"
+                    result = "ok" if ok else ""
             else:
                 method = "browser"
                 ok, err = await post_comment_browser(
@@ -4009,7 +4711,10 @@ class MonitorEngine:
                             else self.cfg.engine.comment_browser_headed))
                 result = "ok" if ok else ""
         except Exception as e:
-            ok, err = False, repr(e)
+            ok, err = False, (str(e) or repr(e))
+
+        uncertain = uncertain or (
+            not ok and str(err or "").startswith("write_uncertain:"))
 
         failure = None if ok or manual_only or uncertain else self.risk.record_failure(
             account_id, OperationKind.COMMENT, err)
@@ -4042,7 +4747,7 @@ class MonitorEngine:
             log.info("评论任务 %s 已发送(%s,作品 %s)", task_id, method, aweme_id)
         else:
             log.info("评论任务 %s 失败: %s", task_id, err)
-        return {"ok": ok, "error": err}
+        return {"ok": ok, "error": err, "method": method}
 
     async def _notify_comments(self, target_name: str, work_desc: str, comments: list):
         with get_session() as s:

@@ -265,6 +265,17 @@
   .fu-cell { display:flex; align-items:center; gap:10px; }
   .fu-cell .avatar { width:36px; height:36px; }
   .fu-cell b { color:var(--fg-strong); }
+  .follow-toolbar { display:flex; align-items:center; justify-content:space-between; gap:10px; margin-bottom:12px; }
+  .follow-toolbar input[type="search"] { width:min(360px,100%); }
+  .follow-sync-status { display:grid; grid-template-columns:minmax(0,1fr) auto; align-items:center; gap:10px; margin:0 0 12px; }
+  .follow-sync-copy { display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:6px; color:var(--mut); font-size:12px; }
+  .follow-sync-copy b { color:var(--fg-strong); font-weight:620; }
+  .follow-pager-time { color:var(--mut); font-size:11px; white-space:nowrap; }
+  @media(max-width:640px) {
+    .follow-toolbar { align-items:stretch; }
+    .follow-toolbar input[type="search"] { min-width:0; }
+    .follow-sync-status { grid-template-columns:1fr; }
+  }
   .fu-sign { color:var(--mut); font-size:11.5px; max-width:360px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 
   /* ── 私信两栏 ── */
@@ -773,6 +784,18 @@
 
   /* ── tables ── */
   .table-wrap { overflow-x:auto; overscroll-behavior-x:contain; -webkit-overflow-scrolling:touch; border-radius:var(--r); border:1px solid var(--line-soft); background:var(--surface); }
+  .transport-matrix { margin-top:18px; }
+  .transport-matrix .table-wrap { margin-top:10px; }
+  .transport-matrix table { min-width:760px; }
+  .transport-matrix td { vertical-align:top; }
+  .transport-mode { display:inline-flex; align-items:center; gap:5px; padding:3px 8px; border-radius:999px; border:1px solid var(--line); font-size:11px; white-space:nowrap; }
+  .transport-mode.api { color:var(--success); background:var(--success-soft); }
+  .transport-mode.browser { color:var(--info); background:var(--info-soft); }
+  .transport-mode.hybrid { color:var(--warn); background:var(--warn-soft); }
+  .transport-mode.unavailable { color:var(--danger); background:var(--danger-soft); }
+  .transport-mode.manual,.transport-mode.deferred { color:var(--mut); background:var(--surface-2); }
+  .isolation-stack { display:flex; flex-wrap:wrap; gap:5px; }
+  .isolation-note { color:var(--mut-2); font-size:11px; line-height:1.45; margin-top:5px; }
   table { width:100%; border-collapse:collapse; }
   thead th { position:sticky; top:0; z-index:1; }
   th, td { text-align:left; padding:10px 12px; border-bottom:1px solid var(--line-soft); font-size:13px; vertical-align:middle; white-space:nowrap; }
@@ -2122,7 +2145,7 @@
     <div class="card">
       <div class="card-head">
         <span class="card-ic"><svg><use href="#i-hash"/></svg></span>
-        <h2>新建抖音关键词采集 <span class="sub">批量搜索视频并抓取评论</span></h2>
+        <h2><span id="collection-create-title">新建关键词采集</span> <span class="sub" id="collection-create-sub">批量搜索作品并抓取评论</span></h2>
       </div>
       <div class="stack">
         <div class="form-field">
@@ -2137,7 +2160,7 @@
           <div class="form-field dy-only"><label for="col-quality">视频画质</label><select id="col-quality"><option value="highest">原画 / 最高</option><option value="1080">1080P</option><option value="720">720P</option><option value="540">540P</option><option value="lowest">最低省流</option></select></div>
         </div>
         <div class="form-grid cols-4 collection-filter-grid" aria-label="搜索深度与排序">
-          <div class="form-field"><label for="col-page-limit">每词采集深度 <span class="field-scope">1–40 页</span></label><input id="col-page-limit" type="number" min="1" max="40" value="12" inputmode="numeric"><p class="hint">一页对应一次搜索结果下滑。</p></div>
+          <div class="form-field"><label for="col-page-limit">每词采集深度 <span class="field-scope">1–40 页</span></label><input id="col-page-limit" type="number" min="1" max="40" value="12" inputmode="numeric"><p class="hint" id="col-page-help">一页对应一次搜索结果下滑。</p></div>
           <div class="form-field"><label for="col-sort">搜索排序</label><select id="col-sort"><option value="general">综合排序</option><option value="latest">最新发布</option><option value="most_liked">最多点赞</option></select></div>
           <div class="form-field"><label for="col-publish-time">发布时间</label><select id="col-publish-time"><option value="all">不限</option><option value="day">一天内</option><option value="week">一周内</option><option value="half_year">半年内</option></select></div>
           <div class="form-field"><label for="col-content-type">内容类型</label><select id="col-content-type"><option value="all">全部作品</option><option value="video">视频</option><option value="images">图文 / 图集</option></select></div>
@@ -2158,11 +2181,11 @@
         </div>
         <div class="option-grid" aria-label="采集选项">
           <label class="switch-row"><input type="checkbox" id="col-download" onchange="applyCollectionForm()"><span class="switch-copy"><b>下载媒体</b><span>保存视频、图集和封面来源</span></span></label>
-          <label class="switch-row"><input type="checkbox" id="col-replies"><span class="switch-copy"><b>包含二级评论</b><span>采集抖音当前可返回的回复</span></span></label>
+          <label class="switch-row"><input type="checkbox" id="col-replies"><span class="switch-copy"><b>包含二级评论</b><span id="col-replies-help">采集平台当前可返回的回复</span></span></label>
         </div>
         <div class="platform-callout" role="note">
           <svg aria-hidden="true"><use href="#i-info"/></svg>
-          <div><b>作品上限、深度页和停止条件任一满足即结束</b><p>抖音采集会临时打开可见浏览器窗口；平台筛选后还会在本地复核类型、时间和数据门槛；任务默认串行执行，可随时取消，已入库结果会保留。</p></div>
+          <div><b id="collection-callout-title">作品上限、采集深度和停止条件任一满足即结束</b><p id="collection-callout-copy">平台筛选后会在本地复核类型、时间和数据门槛；任务默认串行执行，可随时取消，已入库结果会保留。</p></div>
         </div>
         <div class="form-actions">
           <span class="status-text" id="col-create-msg" role="status" aria-live="polite"></span>
@@ -2252,10 +2275,13 @@
         </div>
         <div class="form-grid cols-auto">
           <div class="form-field"><label for="t-acc">使用账号</label><select id="t-acc"></select></div>
-          <div class="form-field"><label for="t-interval">检查频率</label><select id="t-interval">
-              <option value="300">每 5 分钟</option><option value="600">每 10 分钟</option>
+          <div class="form-field"><label for="t-interval">检查频率</label><select id="t-interval" aria-describedby="t-interval-help">
+              <option value="1">每 1 秒</option><option value="5">每 5 秒</option><option value="10">每 10 秒</option>
+              <option value="15">每 15 秒</option><option value="30">每 30 秒</option><option value="60">每 1 分钟</option>
+              <option value="300" selected>每 5 分钟</option><option value="600">每 10 分钟</option>
               <option value="1800">每 30 分钟</option><option value="3600">每小时</option>
-          </select></div>
+              <option value="custom">自定义…</option>
+          </select><p id="t-interval-help" class="field-help">支持秒、分钟和自定义间隔；实际执行仍受任务耗时、错峰和账号限制影响。</p></div>
           <div class="form-field dy-only"><label for="t-quality">视频画质</label><select id="t-quality">
               <option value="">跟随全局设置</option><option value="highest">原画 / 最高</option>
               <option value="1080">1080P</option><option value="720">720P</option>
@@ -2571,10 +2597,17 @@
         <div class="form-grid">
           <div class="form-field">
             <label for="engine-xhs_read_mode">小红书作品获取方式</label>
-            <select id="engine-xhs_read_mode" name="xhs_read_mode" disabled aria-describedby="engine-read-help">
+            <select id="engine-xhs_read_mode" name="xhs_read_mode" disabled aria-describedby="engine-xhs-read-help">
               <option value="browser">浏览器获取（推荐）</option><option value="api">API 直连（兼容模式）</option>
             </select>
-            <p class="field-help" id="engine-read-help">两种方式都读取接口数据。浏览器模式打开账号页面并读取其接口响应。</p>
+            <p class="field-help" id="engine-xhs-read-help">浏览器获取兼容性更好；API 直连不会打开页面。</p>
+          </div>
+          <div class="form-field">
+            <label for="engine-douyin_read_mode">抖音读取方式</label>
+            <select id="engine-douyin_read_mode" name="douyin_read_mode" disabled aria-describedby="engine-douyin-read-help">
+              <option value="hybrid">自动选择（推荐）</option><option value="api">仅 API，不打开浏览器</option><option value="browser">仅浏览器</option>
+            </select>
+            <p class="field-help" id="engine-douyin-read-help">影响关键词采集、作品与互动数据读取。自动选择会优先使用稳定方式，并在明确失败时回退。</p>
           </div>
           <div class="form-field">
             <label for="engine-monitor_initial_backfill_count">抖音新监控的历史作品数量</label>
@@ -2592,6 +2625,40 @@
         </div>
         <p class="field-help" id="engine-comments-help">以上是全局默认范围；单个监控已单独配置时，仍按该监控的设置执行。</p>
       </fieldset>
+      <details class="collection-advanced" id="engine-settings-douyin-account">
+        <summary>抖音本账号功能通道</summary>
+        <div class="collection-advanced-body stack">
+          <div class="form-grid">
+            <div class="form-field"><label for="engine-douyin_profile_mode">手动刷新账号资料</label><select id="engine-douyin_profile_mode" name="douyin_profile_mode" disabled><option value="hybrid">API 优先，浏览器回退（推荐）</option><option value="api">仅 API，不打开浏览器</option><option value="browser">仅浏览器</option></select><p class="field-help">API 模式使用当前账号 Cookie 和独立网络环境直接读取本人资料。</p></div>
+            <div class="form-field"><label for="engine-douyin_followers_mode">粉丝列表同步</label><select id="engine-douyin_followers_mode" name="douyin_followers_mode" disabled><option value="hybrid">API 优先，浏览器回退（推荐）</option><option value="api">仅 API，不打开浏览器</option><option value="browser">仅浏览器</option></select><p class="field-help">直连接口被平台拒绝时，混合模式才会改用浏览器；失败不会清空旧列表。</p></div>
+            <div class="form-field"><label for="engine-douyin_dm_sync_mode">私信会话发现与同步</label><select id="engine-douyin_dm_sync_mode" name="douyin_dm_sync_mode" disabled><option value="hybrid">API 优先，浏览器回退（推荐）</option><option value="api">仅 API，不打开浏览器</option><option value="browser">仅浏览器</option></select><p class="field-help">API 模式通过 imapi protobuf 初始化会话，并继续使用协议读取历史。</p></div>
+            <div class="form-field"><label for="engine-douyin_creator_danmaku_mode">本账号创作中心弹幕</label><select id="engine-douyin_creator_danmaku_mode" name="douyin_creator_danmaku_mode" disabled><option value="hybrid">API 优先，浏览器回退（推荐）</option><option value="api">仅 API，不打开浏览器</option><option value="browser">仅浏览器</option></select><p class="field-help">API 模式按本账号作品 ID 读取弹幕；浏览器模式继续使用创作中心页面。</p></div>
+            <div class="form-field"><label for="engine-douyin_publish_mode">发布视频、图文</label><select id="engine-douyin_publish_mode" name="douyin_publish_mode" disabled><option value="browser">浏览器（当前可用）</option><option value="hybrid" disabled>混合模式（协议待稳定）</option><option value="api" disabled>仅 API（协议待稳定）</option></select><p class="field-help">上传鉴权、安全签名和提交仍由创作中心页面完成。</p></div>
+          </div>
+        </div>
+      </details>
+      <details class="collection-advanced" id="engine-settings-scheduling">
+        <summary>调度与账号保活</summary>
+        <div class="collection-advanced-body stack">
+          <p class="field-help">控制全局任务轮询和账号闲置保活；单个监控填写了自己的间隔时，以单个监控设置为准。</p>
+          <div class="form-grid">
+            <div class="form-field"><label for="engine-scan_interval_seconds">全局扫描间隔（秒）</label><input id="engine-scan_interval_seconds" name="scan_interval_seconds" type="number" min="1" max="86400" step="1" required disabled><p class="field-help">仅影响跟随全局间隔的任务，推荐 300 秒（5 分钟）；实际执行仍受任务耗时、错峰和账号限制影响。</p></div>
+            <div class="form-field"><label for="engine-idle_keepalive_hours">账号闲置保活阈值（小时）</label><input id="engine-idle_keepalive_hours" name="idle_keepalive_hours" type="number" min="0" max="168" step="0.5" required disabled><p class="field-help">账号超过该时长未活跃才执行一次保活；0 表示每轮都检查。</p></div>
+          </div>
+        </div>
+      </details>
+      <details class="collection-advanced" id="engine-settings-collection">
+        <summary>关键词采集与下载 · 常用设置</summary>
+        <div class="collection-advanced-body stack">
+          <p class="field-help">间隔越大采集越慢，但连续请求更少。不确定时保留推荐值。</p>
+          <div class="form-grid">
+            <div class="form-field"><label for="engine-douyin_keyword_gap_seconds">抖音关键词间隔（秒）</label><input id="engine-douyin_keyword_gap_seconds" name="douyin_keyword_gap_seconds" type="number" min="0" max="300" step="0.1" required disabled><p class="field-help">同一任务切换到下一个抖音关键词前的最短等待，推荐 8 秒。</p></div>
+            <div class="form-field"><label for="engine-xhs_keyword_gap_seconds">小红书关键词间隔（秒）</label><input id="engine-xhs_keyword_gap_seconds" name="xhs_keyword_gap_seconds" type="number" min="0" max="300" step="0.1" required disabled><p class="field-help">同一任务切换到下一个小红书关键词前的最短等待，推荐 10 秒。</p></div>
+            <div class="form-field"><label class="switch-row" for="engine-route_download_via_proxy"><input id="engine-route_download_via_proxy" name="route_download_via_proxy" type="checkbox" disabled><span class="switch-copy"><b>下载沿用账号代理</b><span>推荐开启。媒体下载与该账号浏览流量使用相同网络出口。</span></span></label></div>
+            <div class="form-field"><label class="switch-row" for="engine-block_media_resources"><input id="engine-block_media_resources" name="block_media_resources" type="checkbox" disabled><span class="switch-copy"><b>浏览器采集时节省流量</b><span>关闭更稳。开启后会屏蔽图片、视频和字体，页面改版时可能影响采集。</span></span></label></div>
+          </div>
+        </div>
+      </details>
       <details class="collection-advanced" id="engine-settings-advanced">
         <summary>高级选项 · 请求等待与小红书发布</summary>
         <div class="collection-advanced-body stack">
@@ -2604,7 +2671,66 @@
             <div class="form-field"><label for="engine-comment_max_scrolls">评论区默认翻页次数</label><input id="engine-comment_max_scrolls" name="comment_max_scrolls" type="number" min="1" max="30" step="1" required disabled><p class="field-help">更多翻页会增加耗时；单个监控可单独调整。</p></div>
             <div class="form-field"><label for="engine-xhs_publish_mode">小红书发布方式</label><select id="engine-xhs_publish_mode" name="xhs_publish_mode" disabled><option value="browser">浏览器发布（推荐）</option><option value="api">API 直连（兼容模式）</option></select><p class="field-help">仅影响发布，不改变作品监控的获取方式；原生身份账号仍使用浏览器发布。</p></div>
             <div class="form-field"><label for="engine-xhs_comment_write_mode">小红书评论发送方式</label><select id="engine-xhs_comment_write_mode" name="xhs_comment_write_mode" disabled><option value="browser">浏览器发送（推荐）</option><option value="manual">只保存草稿</option><option value="api">API 直连（兼容模式）</option></select></div>
+            <div class="form-field"><label for="engine-douyin_write_mode">抖音写入方式</label><select id="engine-douyin_write_mode" name="douyin_write_mode" disabled><option value="browser">浏览器写入（推荐）</option><option value="hybrid">API 优先，拒绝时浏览器回退</option><option value="api">API 直连</option></select><p class="field-help">影响评论、回复、关注/取关和已有会话私信；发布作品仍使用创作中心浏览器流程。网络结果不确定时不会重复提交。</p></div>
+            <div class="form-field"><label class="switch-row" for="engine-comment_browser_headed"><input id="engine-comment_browser_headed" name="comment_browser_headed" type="checkbox" disabled><span class="switch-copy"><b>评论操作显示浏览器窗口</b><span>推荐开启，遇到登录或验证时可以直接处理；关闭后在后台运行。</span></span></label></div>
             <div class="form-field"><label class="switch-row" for="engine-xhs_comment_review_before_publish"><input id="engine-xhs_comment_review_before_publish" name="xhs_comment_review_before_publish" type="checkbox" disabled><span class="switch-copy"><b>小红书评论先审核</b><span>推荐开启。关闭后，新生成的评论可能直接进入发送队列。</span></span></label></div>
+          </div>
+        </div>
+      </details>
+      <details class="collection-advanced" id="engine-settings-danmaku">
+        <summary>弹幕采集默认范围</summary>
+        <div class="collection-advanced-body stack">
+          <p class="field-help">只影响选择“跟随全局设置”的弹幕监控；单个监控已填写的范围不会被覆盖。</p>
+          <div class="form-grid">
+            <div class="form-field"><label for="engine-danmaku_recent_works">每个账号最近作品数</label><input id="engine-danmaku_recent_works" name="danmaku_recent_works" type="number" min="1" max="100" step="1" required disabled><p class="field-help">推荐 5 个。数量越大，单轮采集时间越长。</p></div>
+            <div class="form-field"><label for="engine-danmaku_recent_days">作品时间范围（天）</label><input id="engine-danmaku_recent_days" name="danmaku_recent_days" type="number" min="1" max="365" step="1" required disabled><p class="field-help">推荐 7 天，只处理该时间范围内发布的作品。</p></div>
+            <div class="form-field"><label for="engine-danmaku_max_scrolls">每个作品最多加载次数</label><input id="engine-danmaku_max_scrolls" name="danmaku_max_scrolls" type="number" min="1" max="30" step="1" required disabled><p class="field-help">推荐 6 次。调大会读取更多弹幕，也会增加耗时。</p></div>
+            <div class="form-field"><label for="engine-danmaku_probe_step_seconds">时间轴探测步长（秒）</label><input id="engine-danmaku_probe_step_seconds" name="danmaku_probe_step_seconds" type="number" min="0.1" max="60" step="0.1" required disabled><p class="field-help">播放页探测弹幕的时间间隔，推荐 1 秒。</p></div>
+            <div class="form-field"><label for="engine-danmaku_max_probe_points">单条视频最多探测点数</label><input id="engine-danmaku_max_probe_points" name="danmaku_max_probe_points" type="number" min="1" max="1000" step="1" required disabled><p class="field-help">提高后覆盖更完整，但会增加播放页请求次数。</p></div>
+            <div class="form-field"><label for="engine-danmaku_max_records_per_scan">单轮最多保存弹幕数</label><input id="engine-danmaku_max_records_per_scan" name="danmaku_max_records_per_scan" type="number" min="0" max="100000" step="1" required disabled><p class="field-help">0 表示不限制单轮入库数量。</p></div>
+            <div class="form-field"><label for="engine-danmaku_max_records_total">每个监控最多保留弹幕数</label><input id="engine-danmaku_max_records_total" name="danmaku_max_records_total" type="number" min="0" max="1000000" step="1" required disabled><p class="field-help">0 表示不限制历史保留数量。</p></div>
+          </div>
+        </div>
+      </details>
+      <details class="collection-advanced" id="engine-settings-dm">
+        <summary>小红书私信监控</summary>
+        <div class="collection-advanced-body stack">
+          <p class="field-help">私信读取默认关闭；开启后仍遵守风控中心的读取间隔和私信额度。自动回复必须同时有启用中的规则。</p>
+          <div class="form-grid">
+            <div class="form-field"><label class="switch-row" for="engine-xhs_dm_monitor_enabled"><input id="engine-xhs_dm_monitor_enabled" name="xhs_dm_monitor_enabled" type="checkbox" disabled><span class="switch-copy"><b>启用私信监控</b><span>按轮询间隔读取新会话。</span></span></label></div>
+            <div class="form-field"><label class="switch-row" for="engine-xhs_dm_realtime_enabled"><input id="engine-xhs_dm_realtime_enabled" name="xhs_dm_realtime_enabled" type="checkbox" disabled><span class="switch-copy"><b>启用实时唤醒</b><span>监听页面 WebSocket 推送，仅用于唤醒读取。</span></span></label></div>
+            <div class="form-field"><label for="engine-xhs_dm_poll_interval_seconds">轮询间隔（秒）</label><input id="engine-xhs_dm_poll_interval_seconds" name="xhs_dm_poll_interval_seconds" type="number" min="30" max="86400" step="1" required disabled></div>
+            <div class="form-field"><label for="engine-xhs_dm_realtime_debounce_seconds">实时推送合并等待（秒）</label><input id="engine-xhs_dm_realtime_debounce_seconds" name="xhs_dm_realtime_debounce_seconds" type="number" min="0.3" max="10" step="0.1" required disabled></div>
+            <div class="form-field"><label for="engine-xhs_dm_fallback_interval_seconds">实时连接补偿间隔（秒）</label><input id="engine-xhs_dm_fallback_interval_seconds" name="xhs_dm_fallback_interval_seconds" type="number" min="120" max="86400" step="1" required disabled></div>
+            <div class="form-field"><label for="engine-xhs_dm_max_conversations_per_poll">每轮最多检查会话数</label><input id="engine-xhs_dm_max_conversations_per_poll" name="xhs_dm_max_conversations_per_poll" type="number" min="1" max="10" step="1" required disabled></div>
+            <div class="form-field"><label class="switch-row" for="engine-xhs_dm_auto_reply_enabled"><input id="engine-xhs_dm_auto_reply_enabled" name="xhs_dm_auto_reply_enabled" type="checkbox" disabled><span class="switch-copy"><b>允许私信自动回复</b><span>仅在规则命中并通过统一审核/风控队列后发送。</span></span></label></div>
+          </div>
+        </div>
+      </details>
+      <details class="collection-advanced" id="engine-settings-write-guards">
+        <summary>写操作基础限制</summary>
+        <div class="collection-advanced-body stack">
+          <p class="field-help">这些是 config.yaml 中的账号级基础限制；风控中心的统一策略可能设置更严格的实际值。0 表示该项不额外限制。</p>
+          <div class="form-grid">
+            <div class="form-field"><label for="engine-comment_daily_cap_per_account">每账号每日自动评论上限</label><input id="engine-comment_daily_cap_per_account" name="comment_daily_cap_per_account" type="number" min="0" max="100000" step="1" required disabled></div>
+            <div class="form-field"><label for="engine-comment_hourly_cap_per_account">每账号每小时自动评论上限</label><input id="engine-comment_hourly_cap_per_account" name="comment_hourly_cap_per_account" type="number" min="0" max="10000" step="1" required disabled></div>
+            <div class="form-field"><label for="engine-comment_min_gap_seconds">自动评论最小间隔（秒）</label><input id="engine-comment_min_gap_seconds" name="comment_min_gap_seconds" type="number" min="0" max="86400" step="1" required disabled></div>
+            <div class="form-field"><label for="engine-action_daily_cap_per_account">每账号每日关注/取关/私信上限</label><input id="engine-action_daily_cap_per_account" name="action_daily_cap_per_account" type="number" min="0" max="100000" step="1" required disabled></div>
+            <div class="form-field"><label for="engine-action_hourly_cap_per_account">每账号每小时动作上限</label><input id="engine-action_hourly_cap_per_account" name="action_hourly_cap_per_account" type="number" min="0" max="10000" step="1" required disabled></div>
+            <div class="form-field"><label for="engine-action_min_gap_seconds">账号动作最小间隔（秒）</label><input id="engine-action_min_gap_seconds" name="action_min_gap_seconds" type="number" min="0" max="86400" step="1" required disabled></div>
+          </div>
+        </div>
+      </details>
+      <details class="collection-advanced" id="engine-settings-isolation">
+        <summary>代理校验与写入门禁</summary>
+        <div class="collection-advanced-body stack">
+          <p class="field-help">用于多账号环境隔离的运行开关。新建 native 账号的写操作会按这里的门禁检查浏览器和代理基线。</p>
+          <div class="form-grid">
+            <div class="form-field"><label class="switch-row" for="engine-verify_proxy_region"><input id="engine-verify_proxy_region" name="verify_proxy_region" type="checkbox" disabled><span class="switch-copy"><b>校验代理出口地区</b><span>将代理出口国家与账号时区进行比对并记录告警。</span></span></label></div>
+            <div class="form-field"><label class="switch-row" for="engine-native_write_gate_enabled"><input id="engine-native_write_gate_enabled" name="native_write_gate_enabled" type="checkbox" disabled><span class="switch-copy"><b>启用 native 写入门禁</b><span>写操作前检查账号浏览器和网络基线。</span></span></label></div>
+            <div class="form-field"><label class="switch-row" for="engine-native_write_require_system_chrome"><input id="engine-native_write_require_system_chrome" name="native_write_require_system_chrome" type="checkbox" disabled><span class="switch-copy"><b>写入必须使用系统 Chrome</b><span>提高多账号浏览器环境一致性。</span></span></label></div>
+            <div class="form-field"><label class="switch-row" for="engine-native_write_require_verified_proxy"><input id="engine-native_write_require_verified_proxy" name="native_write_require_verified_proxy" type="checkbox" disabled><span class="switch-copy"><b>写入必须通过代理验证</b><span>已配置代理的账号需先建立出口基线。</span></span></label></div>
+            <div class="form-field"><label for="engine-native_write_proxy_max_age_seconds">代理基线有效期（小时）</label><input id="engine-native_write_proxy_max_age_seconds" name="native_write_proxy_max_age_seconds" data-scale="3600" type="number" min="0" max="168" step="1" required disabled><p class="field-help">0 表示不自动过期；过期后需重新测试代理。</p></div>
           </div>
         </div>
       </details>
@@ -2613,7 +2739,7 @@
         <div class="collection-advanced-body stack">
           <div class="form-field"><label class="switch-row" for="engine-work_health_enabled"><input id="engine-work_health_enabled" name="work_health_enabled" type="checkbox" disabled><span class="switch-copy"><b>定时检查本账号作品</b><span>默认关闭。开启后会定时打开账号页面读取作品状态；推送还需在通知页配置渠道。</span></span></label></div>
           <div class="form-grid">
-            <div class="form-field"><label for="engine-work_health_interval_seconds">检查间隔（分钟）</label><input id="engine-work_health_interval_seconds" name="work_health_interval_seconds" data-scale="60" type="number" min="10" max="1440" step="1" required disabled></div>
+            <div class="form-field"><label for="engine-work_health_interval_seconds">检查间隔（秒）</label><input id="engine-work_health_interval_seconds" name="work_health_interval_seconds" type="number" min="600" max="86400" step="1" required disabled><p class="field-help">作品健康检查保留最低 600 秒（10 分钟），推荐 3600 秒。</p></div>
             <div class="form-field"><label for="engine-work_health_recent_days">检查最近几天的作品</label><input id="engine-work_health_recent_days" name="work_health_recent_days" type="number" min="1" max="90" step="1" required disabled></div>
             <div class="form-field"><label for="engine-work_health_zero_play_hours">零播放提醒阈值（小时）</label><input id="engine-work_health_zero_play_hours" name="work_health_zero_play_hours" type="number" min="1" max="168" step="0.5" required disabled><p class="field-help">发布达到该时长且播放量仍为 0 时提醒，仅适用于提供播放量的平台。</p></div>
             <div class="form-field"><label class="switch-row" for="engine-work_health_stat_snapshots"><input id="engine-work_health_stat_snapshots" name="work_health_stat_snapshots" type="checkbox" disabled><span class="switch-copy"><b>记录账号数据快照</b><span>在已有账号检查中保存粉丝、作品等数据，供趋势查看。</span></span></label></div>
@@ -2628,6 +2754,25 @@
         <button type="submit" id="engine-settings-save" disabled><svg aria-hidden="true"><use href="#i-check"/></svg>保存采集设置</button>
       </div>
     </form>
+    <details class="collection-advanced transport-matrix" id="transport-matrix-panel" open>
+      <summary>API 兼容矩阵与多账号隔离</summary>
+      <div class="collection-advanced-body stack">
+        <div class="row-between gap-wrap">
+          <p class="field-help" style="margin:0">矩阵按当前保存设置显示真实执行通道；“仅 API”不会暗中打开浏览器。API 会话按账号独立创建，并复用该账号的 Cookie、UA、语言、视口和代理；浏览器 TLS/Canvas 指纹不等同于直连 API 会话。</p>
+          <button type="button" class="ghost sm" onclick="CreatorHubTransportMatrix.load()">刷新矩阵</button>
+        </div>
+        <div class="table-wrap"><table aria-label="平台 API 与浏览器兼容矩阵">
+          <thead><tr><th>平台</th><th>功能</th><th>API</th><th>浏览器</th><th>当前通道</th><th>说明</th></tr></thead>
+          <tbody id="transport-matrix-body"><tr><td colspan="6"><div class="empty">正在读取兼容矩阵…</div></td></tr></tbody>
+        </table></div>
+        <h3 style="margin:4px 0 0">账号环境隔离</h3>
+        <div class="table-wrap"><table aria-label="多账号 API 与浏览器环境隔离状态">
+          <thead><tr><th>账号</th><th>浏览器 Profile</th><th>API 登录态/会话</th><th>网络出口</th><th>环境编号</th></tr></thead>
+          <tbody id="transport-isolation-body"><tr><td colspan="5"><div class="empty">正在检查账号环境…</div></td></tr></tbody>
+        </table></div>
+        <p class="field-help" id="transport-matrix-status" role="status" aria-live="polite"></p>
+      </div>
+    </details>
   </div>
   </section>
 
@@ -2978,9 +3123,12 @@
               <option value="public">公开评论区</option><option value="creator">创作中心（仅自有账号）</option>
           </select></div>
           <div class="form-field"><label for="w-acc">使用账号</label><select id="w-acc"></select></div>
-          <div class="form-field"><label for="w-interval">检查频率</label><select id="w-interval">
-              <option value="600">每 10 分钟</option><option value="1800">每 30 分钟</option><option value="3600">每小时</option>
-          </select></div>
+          <div class="form-field"><label for="w-interval">检查频率</label><select id="w-interval" aria-describedby="w-interval-help">
+              <option value="1">每 1 秒</option><option value="5">每 5 秒</option><option value="10">每 10 秒</option>
+              <option value="15">每 15 秒</option><option value="30">每 30 秒</option><option value="60">每 1 分钟</option>
+              <option value="300">每 5 分钟</option><option value="600" selected>每 10 分钟</option><option value="1800">每 30 分钟</option><option value="3600">每小时</option>
+              <option value="custom">自定义…</option>
+          </select><p id="w-interval-help" class="field-help">支持秒、分钟和自定义间隔；实际执行仍受任务耗时、错峰和账号限制影响。</p></div>
         </div>
         <div class="meta-fields">
           <div>
@@ -3144,9 +3292,13 @@
             <option value="public">公开视频播放页</option><option value="creator">创作中心（自己的视频）</option>
           </select></div>
           <div class="form-field"><label for="d-w-acc" id="d-w-acc-label">播放页账号（可选）</label><select id="d-w-acc"></select></div>
-          <div class="form-field"><label for="d-w-interval">检查频率</label><select id="d-w-interval">
-            <option value="0" selected>跟随全局设置</option><option value="300">每 5 分钟</option><option value="600">每 10 分钟</option><option value="1800">每 30 分钟</option><option value="3600">每小时</option>
-          </select></div>
+          <div class="form-field"><label for="d-w-interval">检查频率</label><select id="d-w-interval" aria-describedby="d-w-interval-help">
+            <option value="0" selected>跟随全局设置</option>
+            <option value="1">每 1 秒</option><option value="5">每 5 秒</option><option value="10">每 10 秒</option>
+            <option value="15">每 15 秒</option><option value="30">每 30 秒</option><option value="60">每 1 分钟</option>
+            <option value="300">每 5 分钟</option><option value="600">每 10 分钟</option><option value="1800">每 30 分钟</option><option value="3600">每小时</option>
+            <option value="custom">自定义…</option>
+          </select><p id="d-w-interval-help" class="field-help">支持秒、分钟和自定义间隔；实际执行仍受任务耗时、错峰和账号限制影响。</p></div>
         </div>
         <div class="meta-fields">
           <div><label class="field" for="d-w-alias">管理别名(可选)</label><input id="d-w-alias" maxlength="60" placeholder="如：新品视频弹幕"></div>
@@ -3301,25 +3453,44 @@
       </div>
 
       <div data-hubpanel="following" style="display:none">
-        <div style="display:flex;gap:12px;align-items:flex-start;margin-bottom:12px">
-          <div class="hint" style="margin:0;flex:1">关注/粉丝无公开接口,通过该账号登录态打开关注页拦截抓取。首次抓不到时请把服务端控制台的 <code>[follow]</code> 日志发我以标定接口。</div>
-          <button class="ghost sm" style="flex:0 0 auto" onclick="syncFollows('following')"><svg><use href="#i-download"/></svg>同步关注</button>
+        <div class="follow-toolbar">
+          <input id="following-search" type="search" placeholder="搜索关注用户" aria-label="搜索关注用户" oninput="queueFollowSearch('following')">
+          <button class="ghost sm" onclick="syncFollows('following')"><svg><use href="#i-download"/></svg>同步关注</button>
         </div>
+        <div id="following-sync-status" class="follow-sync-status" hidden></div>
         <div class="table-wrap"><table aria-label="关注列表"><thead><tr><th>用户</th><th>关系</th><th>操作</th></tr></thead><tbody id="following-table"></tbody></table></div>
+        <div id="following-pager" class="danmaku-pager" hidden>
+          <div class="danmaku-pager-left"><span id="following-page-info" class="danmaku-page-info"></span></div>
+          <div class="danmaku-pager-center">
+            <button class="ghost sm danmaku-page-icon" data-tip="上一页" aria-label="关注列表上一页" onclick="changeFollowPage('following',-1)"><svg><use href="#i-prev"/></svg></button>
+            <button class="ghost sm danmaku-page-icon" data-tip="下一页" aria-label="关注列表下一页" onclick="changeFollowPage('following',1)"><svg><use href="#i-next"/></svg></button>
+          </div>
+          <div class="danmaku-pager-right"><span id="following-synced-at" class="follow-pager-time"></span></div>
+        </div>
       </div>
 
       <div data-hubpanel="fans" style="display:none">
-        <div style="display:flex;gap:12px;align-items:flex-start;margin-bottom:12px">
-          <div class="hint" style="margin:0;flex:1">粉丝列表通过该账号登录态打开粉丝页拦截抓取。可对未回关的粉丝发起「回关」。</div>
-          <button class="ghost sm" style="flex:0 0 auto" onclick="syncFollows('fan')"><svg><use href="#i-download"/></svg>同步粉丝</button>
+        <div class="follow-toolbar">
+          <input id="fan-search" type="search" placeholder="搜索粉丝" aria-label="搜索粉丝" oninput="queueFollowSearch('fan')">
+          <button class="ghost sm" onclick="syncFollows('fan')"><svg><use href="#i-download"/></svg>同步粉丝</button>
         </div>
+        <div id="fan-sync-status" class="follow-sync-status" hidden></div>
         <div class="table-wrap"><table aria-label="粉丝列表"><thead><tr><th>用户</th><th>关系</th><th>操作</th></tr></thead><tbody id="fans-table"></tbody></table></div>
+        <div id="fan-pager" class="danmaku-pager" hidden>
+          <div class="danmaku-pager-left"><span id="fan-page-info" class="danmaku-page-info"></span></div>
+          <div class="danmaku-pager-center">
+            <button class="ghost sm danmaku-page-icon" data-tip="上一页" aria-label="粉丝列表上一页" onclick="changeFollowPage('fan',-1)"><svg><use href="#i-prev"/></svg></button>
+            <button class="ghost sm danmaku-page-icon" data-tip="下一页" aria-label="粉丝列表下一页" onclick="changeFollowPage('fan',1)"><svg><use href="#i-next"/></svg></button>
+          </div>
+          <div class="danmaku-pager-right"><span id="fan-synced-at" class="follow-pager-time"></span></div>
+        </div>
       </div>
 
       <div data-hubpanel="dm" style="display:none">
         <div style="display:flex;gap:12px;align-items:flex-start;margin-bottom:12px">
           <div class="hint" style="margin:0;flex:1"><span class="ic-text"><svg aria-hidden="true"><use href="#i-msg"/></svg><b>网页私信</b></span>：抖音与小红书均可同步会话和历史。小红书复用账号 Chrome 的原生实时推送，并以低频检查补偿漏推；自动回复默认先生成待审核草稿。</div>
           <button class="ghost sm" style="flex:0 0 auto" onclick="syncDm()"><svg><use href="#i-download"/></svg>同步</button>
+          <button class="ghost sm dy-only" style="flex:0 0 auto" onclick="startNewDm()"><svg><use href="#i-plus"/></svg>新私信</button>
           <button style="flex:0 0 auto" onclick="openHubAccountBrowser()"><svg><use href="#i-send"/></svg>打开浏览器收发</button>
         </div>
         <details class="dm-auto" id="dm-auto-panel">

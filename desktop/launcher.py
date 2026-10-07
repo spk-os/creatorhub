@@ -114,6 +114,42 @@ def child_command(*args: str) -> list[str]:
     return [sys.executable, str(Path(__file__).resolve()), *args]
 
 
+def utf8_child_environment(**overrides: str) -> dict[str, str]:
+    """Return a deterministic Unicode environment for Python child processes."""
+    env = {
+        **os.environ,
+        "PYTHONUTF8": "1",
+        "PYTHONIOENCODING": "utf-8",
+        "PYTHONUNBUFFERED": "1",
+    }
+    env.update(overrides)
+    return env
+
+
+def configure_process_streams(home: Path) -> None:
+    """Make frozen and redirected output independent of the Windows code page."""
+    if sys.stdout is None or sys.stderr is None:
+        (home / "logs").mkdir(parents=True, exist_ok=True)
+        stream = (home / "logs" / f"process-{os.getpid()}.log").open(
+            "a", encoding="utf-8", errors="backslashreplace", buffering=1
+        )
+        sys.stdout = sys.stderr = stream
+
+    configured = set()
+    for stream in (sys.stdout, sys.stderr):
+        if id(stream) in configured:
+            continue
+        configured.add(id(stream))
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            try:
+                reconfigure(encoding="utf-8", errors="backslashreplace")
+            except (OSError, ValueError):
+                # Some embedded/test streams cannot be reconfigured. They remain
+                # usable, while real TextIOWrapper streams are forced to UTF-8.
+                pass
+
+
 def serve(home: Path, session: str, install_browser: bool, parent_pid=0) -> int:
     from desktop.lifecycle import watch_parent
     service_lock = InstanceLock(home, "service.lock")
@@ -199,6 +235,12 @@ def smoke_test() -> int:
             assert app and (WEB_DIR / "workbench.js").is_file()
             assert (resources() / "config.example.yaml").is_file()
             assert (resources() / "desktop-guide" / "xhs" / "index.html").is_file()
+            if getattr(sys, "frozen", False):
+                updater = resources() / "desktop" / "CreatorHubUpdater.exe"
+                assert updater.is_file()
+                from desktop.update_helper import clean_environment
+                subprocess.run([str(updater), "--self-test"], env=clean_environment(),
+                               check=True, timeout=30, creationflags=subprocess.CREATE_NO_WINDOW)
             assert all(Path(path).is_file() for path in compute_driver_executable())
             assert Path(get_ffmpeg_exe()).is_file()
             with sync_playwright() as playwright:
@@ -217,6 +259,55 @@ def smoke_test() -> int:
         finally:
             os.chdir(previous)
     return 0
+
+
+def update_health_check() -> int:
+    """Import/resource readiness only; never start services or migrate user data."""
+    import tempfile
+    previous = Path.cwd()
+    with tempfile.TemporaryDirectory(prefix="creatorhub-health-") as temp:
+        try:
+            os.chdir(temp)
+            os.environ["CREATORHUB_CONFIG_PATH"] = str(Path(temp) / "absent.yaml")
+            from app.main import app, WEB_DIR
+            from desktop.controller import Controller
+            from desktop.web_shell import ShellServer
+            from patchright._impl._driver import compute_driver_executable
+            from imageio_ffmpeg import get_ffmpeg_exe
+            import webview
+            assert app and Controller and ShellServer and webview
+            assert (WEB_DIR / "workbench.js").is_file()
+            for name in ("desktop/web/app.js", "desktop/web/index.html", "config.example.yaml"):
+                assert (resources() / name).is_file(), name
+            assert all(Path(path).is_file() for path in compute_driver_executable())
+            assert Path(get_ffmpeg_exe()).is_file()
+            return 0
+        finally:
+            os.chdir(previous)
+
+
+def recover_interrupted_update(home):
+    from desktop.update_delta import read_journal
+    journal = read_journal(home)
+    if not journal or journal.get("phase") in {"committed", "rolled_back"}:
+        return False
+    from desktop.update_helper import clean_environment
+    helper = home / "runtime/updates" / journal["attempt"] / "CreatorHubUpdater.exe"
+    ready = home / "runtime/update-recovery-ready.json"
+    ready.unlink(missing_ok=True)
+    (home / "runtime/update-recovery-cancel").unlink(missing_ok=True)
+    child = subprocess.Popen([str(helper), "--recover-home", str(home), "--parent-pid", str(os.getpid())],
+                             cwd=home, env=clean_environment(), creationflags=subprocess.CREATE_NO_WINDOW)
+    deadline = time.monotonic() + 20
+    while time.monotonic() < deadline:
+        if child.poll() is not None:
+            break
+        if ready.is_file() and ready.stat().st_size < 1024:
+            if json.loads(ready.read_text(encoding="utf-8")).get("pid") == os.getpid():
+                return True
+        time.sleep(.1)
+    (home / "runtime/update-recovery-cancel").touch()
+    raise RuntimeError("上次更新中断，请使用完整安装包修复。用户数据与更新备份保留。")
 
 
 class Launcher:
@@ -263,7 +354,7 @@ class Launcher:
             log = self.home / "logs" / f"desktop-{time.strftime('%Y%m%d-%H%M%S')}.log"
             self.events.put(("status", "正在启动；如缺少浏览器组件，将自动下载…"))
             with log.open("w", encoding="utf-8") as output:
-                env = {**os.environ, "PYTHONUTF8": "1", "PYTHONUNBUFFERED": "1"}
+                env = utf8_child_environment(CREATORHUB_DESKTOP_HOME=str(self.home))
                 self.process = subprocess.Popen(child_command("--serve", "--session", self.session, "--parent-pid", str(os.getpid())),
                     cwd=self.home, env=env, stdout=output, stderr=subprocess.STDOUT,
                     creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
@@ -422,11 +513,14 @@ def main() -> int:
     parser.add_argument("--session", default="")
     parser.add_argument("--parent-pid", type=int, default=0)
     parser.add_argument("--smoke-test", action="store_true")
+    parser.add_argument("--update-health-check", action="store_true")
     parser.add_argument("--shell-smoke-test", action="store_true")
     parser.add_argument("--skip-browser-install", action="store_true")
     parser.add_argument("--legacy-ui", action="store_true", help="Use the legacy emergency window")
     parser.add_argument("--no-autostart", action="store_true")
     args = parser.parse_args()
+    if args.update_health_check:
+        return update_health_check()
     if args.shell_smoke_test:
         from desktop.webview_smoke import smoke
         return smoke()
@@ -434,6 +528,8 @@ def main() -> int:
         return smoke_test()
     home = user_directory()
     prepare_home(home)
+    if os.name == "nt" and getattr(sys, "frozen", False) and recover_interrupted_update(home):
+        return 0
     if args.serve:
         if not args.session or any(c not in "0123456789abcdef" for c in args.session):
             raise ValueError("Invalid desktop session")
@@ -455,12 +551,7 @@ def main() -> int:
 if __name__ == "__main__":
     import multiprocessing
     multiprocessing.freeze_support()
-    # Windowed frozen executables may not initialize Python's standard streams.
-    if sys.stdout is None or sys.stderr is None:
-        home = user_directory()
-        (home / "logs").mkdir(parents=True, exist_ok=True)
-        stream = (home / "logs" / f"process-{os.getpid()}.log").open("a", encoding="utf-8", buffering=1)
-        sys.stdout = sys.stderr = stream
+    configure_process_streams(user_directory())
     try:
         result = main()
     except Exception:

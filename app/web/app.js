@@ -1056,7 +1056,7 @@ const PAGE_META = {
     title: "作品监控", desc: "追踪关注的创作者，检查采集进度与新作品。"
   },
   collections: {
-    title: "关键词批量采集", desc: "批量搜索抖音视频，并按上限采集评论与媒体。"
+    title: "关键词批量采集", desc: "批量搜索平台作品，并按上限采集评论与媒体。"
   },
   comments: {
     title: "评论监控", desc: "订阅作品或账号评论，按来源、分组和标签筛选。"
@@ -1127,6 +1127,7 @@ function switchPlatform(pf) {
   });
   try { localStorage.setItem("dym-pf", pf); } catch (e) {}
   applyPlatformUI();
+  ["t-interval", "w-interval", "d-w-interval"].forEach(id => $(id)?._monitorIntervalSync?.());
   // 切换后立刻刷新该平台数据
   refreshAccounts(); refreshMonitors(); refreshContents(); refreshWatches(); refreshComments(); refreshDanmakuWatches(); refreshDanmaku(); refreshCollections();
   updateTaskQueuePlatformLabel();
@@ -1155,7 +1156,8 @@ function applyPlatformUI() {
   document.querySelectorAll(".ks-only").forEach(e => e.classList.toggle("hidden", PLATFORM !== "kuaishou"));
   document.querySelectorAll(".sh-only").forEach(e => e.classList.toggle("hidden", PLATFORM !== "shipinhao"));
   document.querySelectorAll(".notsh-only").forEach(e => e.classList.toggle("hidden", pfIsChannels(PLATFORM)));
-  document.querySelectorAll(".collect-only").forEach(e => e.classList.toggle("hidden", PLATFORM !== "douyin"));
+  document.querySelectorAll(".collect-only").forEach(e => e.classList.toggle(
+    "hidden", !["douyin", "xhs"].includes(PLATFORM)));
   document.querySelectorAll(".meta-scope").forEach(e => {
     e.textContent = (PF_NAME[PLATFORM] || "当前平台") + "内独立";
   });
@@ -1220,7 +1222,7 @@ function applyPlatformUI() {
     // 视频号本账号只有「我的作品 / 数据」;若停在关注/粉丝/私信子页,切回我的作品
     if (["following", "fans", "dm"].includes(HUB_TAB)) switchHubTab("myworks");
   }
-  if (PLATFORM !== "douyin" && CURRENT_TAB === "collections") switchTab("overview");
+  if (!["douyin", "xhs"].includes(PLATFORM) && CURRENT_TAB === "collections") switchTab("overview");
   // 不支持发布的平台:若正停在该面板则回到总览(当前四平台均支持,兜底保留)
   if (!pfHasPublish(PLATFORM)) {
     const pub = document.querySelector('[data-panel="publish"]');
@@ -2802,6 +2804,7 @@ let HUB_ACC = "";
 let HUB_TAB = (() => { try { return localStorage.getItem("dym-hubtab") || "myworks"; } catch (e) { return "myworks"; } })();
 let DM_CONV = null;     // 当前打开的会话 id
 let DM_CONVS = [];      // 会话缓存(供发送时取 peer 信息)
+let DM_NEW_TARGET = ""; // 尚未建会的抖音号或 sec_uid
 function hubAccKey() { return "dym-hubacc:" + PLATFORM; }
 function loadHubAcc() { try { HUB_ACC = localStorage.getItem(hubAccKey()) || ""; } catch (e) { HUB_ACC = ""; } }
 function setHubAcc(id) { HUB_ACC = String(id || ""); try { localStorage.setItem(hubAccKey(), HUB_ACC); } catch (e) {} if (HUB_TAB === "dm") startDmStream(); }
@@ -2847,7 +2850,7 @@ async function checkBrowserEnvironment(id) {
   });
 }
 
-// 私信页:用当前选中账号打开真实浏览器手动收发(抖音私信走 WS,只能这样)
+// 私信页:用当前选中账号打开真实浏览器手动收发。
 function openHubAccountBrowser() {
   if (!HUB_ACC) { toast("请先选择账号", "err"); return; }
   openAccountBrowser(+HUB_ACC);
@@ -2858,6 +2861,7 @@ function openAccountHub(id) {
   setHubAcc(id);
   const s = $("hub-acc"); if (s) { s.value = HUB_ACC; if (s._csSync) s._csSync(); }
   DM_CONV = null;
+  DM_NEW_TARGET = "";
   refreshHubSummary();
   switchTab("hub");
   switchHubTab("myworks");   // 默认落到「我的作品」,可再切关注/粉丝/私信
@@ -2878,7 +2882,15 @@ function populateHubAccounts() {
 function onHubAcc() {
   const sel = $("hub-acc"); if (!sel) return;
   setHubAcc(sel.value);
+  for (const direction of ["following", "fan"]) {
+    if (typeof FOLLOW_STATE !== "undefined") {
+      FOLLOW_STATE[direction] = { page: 1, pages: 1, total: 0, query: "" };
+      FOLLOW_JOB_IDS[direction] = "";
+    }
+    const search = $(`${direction}-search`); if (search) search.value = "";
+  }
   DM_CONV = null;
+  DM_NEW_TARGET = "";
   refreshHubSummary();
   refreshHubPanel();
 }
@@ -3024,7 +3036,11 @@ function monitorOwnWorkDanmaku(itemId, accountId) {
 async function syncMyWorks() {
   if (!HUB_ACC) { toast("请先选择账号", "err"); return; }
   await withBusy(evtBtn(), "同步中", async () => {
-    try { const r = await api("/api/accounts/" + HUB_ACC + "/works/sync", { method: "POST" }); toast(`同步完成:抓到 ${r.fetched} 条,新增 ${r.added}`, "ok"); }
+    try {
+      const r = await api("/api/accounts/" + HUB_ACC + "/works/sync", { method: "POST" });
+      if (r.skipped) { toast(`同步暂缓:${r.reason || "操作间隔尚未结束"}`, "info", 5000); return; }
+      toast(`同步完成:抓到 ${Number(r.fetched) || 0} 条,新增 ${Number(r.added) || 0}${transportSourceSuffix(r.source)}`, "ok");
+    }
     catch (e) { toast("同步失败:" + e.message, "err"); }
   });
   refreshMyWorks();
@@ -3069,7 +3085,11 @@ function cmtRow(c) {
 async function syncWorkComments() {
   if (!WC_WORK) return;
   await withBusy(evtBtn(), "抓取中", async () => {
-    try { const r = await api("/api/account-works/" + WC_WORK.id + "/comments/sync", { method: "POST" }); toast(`抓到 ${r.fetched} 条,新增 ${r.added}`, "ok"); }
+    try {
+      const r = await api("/api/account-works/" + WC_WORK.id + "/comments/sync", { method: "POST" });
+      if (r.skipped) { toast(`抓取暂缓:${r.reason || "操作间隔尚未结束"}`, "info", 5000); return; }
+      toast(`抓到 ${Number(r.fetched) || 0} 条,新增 ${Number(r.added) || 0}${transportSourceSuffix(r.source)}`, "ok");
+    }
     catch (e) { toast("抓取失败:" + e.message, "err"); }
   });
   await loadWorkComments();
@@ -3078,24 +3098,129 @@ async function syncWorkComments() {
 // ── 关注 / 粉丝 ──
 // 小红书网页端不提供关注/粉丝列表(App 专属:实测无接口、无弹层),不做无用的同步
 const XHS_FOLLOW_NA = "小红书网页端不提供关注 / 粉丝列表(仅 App 可见),无法同步。抖音 / 快手可正常同步。";
-async function refreshFollows(direction) {
+const FOLLOW_PAGE_SIZE = 50;
+const FOLLOW_STATE = {
+  following: { page: 1, pages: 1, total: 0, query: "" },
+  fan: { page: 1, pages: 1, total: 0, query: "" },
+};
+const FOLLOW_JOB_IDS = { following: "", fan: "" };
+const FOLLOW_JOB_POLLING = { following: "", fan: "" };
+const FOLLOW_SEARCH_TIMERS = { following: null, fan: null };
+
+function followElementPrefix(direction) { return direction === "fan" ? "fan" : "following"; }
+function queueFollowSearch(direction) {
+  clearTimeout(FOLLOW_SEARCH_TIMERS[direction]);
+  FOLLOW_SEARCH_TIMERS[direction] = setTimeout(() => {
+    const input = $(`${followElementPrefix(direction)}-search`);
+    FOLLOW_STATE[direction].query = String(input?.value || "").trim();
+    refreshFollows(direction, 1);
+  }, 250);
+}
+function renderFollowPager(direction, payload) {
+  const prefix = followElementPrefix(direction), state = FOLLOW_STATE[direction];
+  state.page = Math.max(1, Number(payload.page || 1));
+  state.pages = Math.max(1, Number(payload.pages || 1));
+  state.total = Math.max(0, Number(payload.total || 0));
+  const pager = $(`${prefix}-pager`), info = $(`${prefix}-page-info`);
+  if (!pager || !info) return;
+  info.textContent = `第 ${state.page} / ${state.pages} 页 · 共 ${fmtNum(state.total)} 条`;
+  const buttons = pager.querySelectorAll("button");
+  if (buttons[0]) buttons[0].disabled = state.page <= 1;
+  if (buttons[1]) buttons[1].disabled = state.page >= state.pages;
+  const synced = $(`${prefix}-synced-at`);
+  if (synced) synced.textContent = payload.synced_at ? `同步于 ${fmtTime(payload.synced_at)}` : "";
+  pager.hidden = state.total <= FOLLOW_PAGE_SIZE;
+}
+function changeFollowPage(direction, delta) {
+  const state = FOLLOW_STATE[direction];
+  refreshFollows(direction, Math.max(1, Math.min(state.pages, state.page + Number(delta || 0))));
+}
+function renderFollowSyncStatus(direction, job) {
+  const box = $(`${followElementPrefix(direction)}-sync-status`); if (!box) return;
+  if (!job || job.status === "idle") {
+    FOLLOW_JOB_IDS[direction] = "";
+    box.hidden = true; box.innerHTML = ""; return;
+  }
+  FOLLOW_JOB_IDS[direction] = job.id || FOLLOW_JOB_IDS[direction];
+  const phase = {
+    queued: "等待同步", fetching: "正在获取", saving: "正在写入",
+    completed: "同步完成", failed: "同步失败", canceled: "已取消",
+    canceling: "正在取消", deferred: "同步暂缓",
+  }[job.phase || job.status] || "同步中";
+  const fetched = Math.max(0, Number(job.fetched || 0));
+  const expected = Math.max(0, Number(job.expected_total || 0));
+  const saved = Math.max(0, Number(job.saved || 0));
+  const detail = job.phase === "saving"
+    ? `已写入 ${fmtNum(saved)} / ${fmtNum(fetched)} 条`
+    : expected ? `已获取 ${fmtNum(fetched)} / 约 ${fmtNum(expected)} 条 · ${fmtNum(job.pages || 0)} 页`
+      : `已获取 ${fmtNum(fetched)} 条 · ${fmtNum(job.pages || 0)} 页`;
+  const percent = job.percent == null ? 0 : Math.max(0, Math.min(100, Number(job.percent)));
+  const error = job.error ? `<div class="mut" style="margin-top:6px;color:var(--danger)">${esc(job.error)}</div>` : "";
+  box.innerHTML = `<div><div class="follow-sync-copy"><b>${esc(phase)}</b><span>${esc(detail)}</span></div>`
+    + `<div class="progress-track" role="progressbar" aria-label="${esc(phase)}" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${percent}"><div class="progress-fill" style="width:${percent}%"></div></div>${error}</div>`
+    + (job.cancelable ? `<button class="ghost sm danger" onclick="cancelFollowSync(${jsArg(direction)})">${ic("i-x")}取消</button>` : "");
+  box.hidden = false;
+}
+async function pollFollowSync(direction, jobId) {
+  if (!jobId || FOLLOW_JOB_POLLING[direction] === jobId) return;
+  FOLLOW_JOB_POLLING[direction] = jobId;
+  const accountId = HUB_ACC;
+  try {
+    while (FOLLOW_JOB_IDS[direction] === jobId && HUB_ACC === accountId) {
+      const job = await api(`/api/follow-sync-jobs/${encodeURIComponent(jobId)}`);
+      renderFollowSyncStatus(direction, job);
+      if (["completed", "failed", "canceled", "deferred"].includes(job.status)) {
+        if (job.status === "completed") {
+          toast(`同步完成:共 ${fmtNum(job.saved || job.fetched || 0)} 条,新增 ${fmtNum(job.added || 0)}${transportSourceSuffix(job.source)}`, "ok", 5000);
+          await refreshFollows(direction, 1);
+          refreshHubSummary();
+        } else if (job.status === "failed") toast("同步失败:" + (job.error || "未知错误"), "err");
+        else if (job.status === "deferred") toast("同步暂缓:" + (job.error || "操作间隔尚未结束"), "info", 5000);
+        return;
+      }
+      await new Promise(resolve => setTimeout(resolve, 1200));
+    }
+  } catch (e) {
+    if (HUB_ACC === accountId) toast("读取同步进度失败:" + e.message, "err");
+  } finally {
+    if (FOLLOW_JOB_POLLING[direction] === jobId) FOLLOW_JOB_POLLING[direction] = "";
+  }
+}
+async function refreshFollowSyncJob(direction) {
+  if (!HUB_ACC) return;
+  try {
+    const job = await api(`/api/accounts/${HUB_ACC}/follows/sync-job?direction=${direction}`);
+    renderFollowSyncStatus(direction, job);
+    if (["queued", "running", "canceling"].includes(job.status)) pollFollowSync(direction, job.id);
+  } catch (e) {}
+}
+async function refreshFollows(direction, page = null) {
   const isCurrent = beginViewRequest(`follows:${direction}`, () => String(HUB_ACC));
   const tbody = $(direction === "fan" ? "fans-table" : "following-table"); if (!tbody) return;
   if (PLATFORM === "xhs") {
     const badge = $(direction === "fan" ? "hb-fans" : "hb-following");
     if (badge) badge.textContent = "—";
+    const pager = $(`${followElementPrefix(direction)}-pager`); if (pager) pager.hidden = true;
     tbody.innerHTML = empty(3, direction === "fan" ? "粉丝列表网页端不可用" : "关注列表网页端不可用",
       "i-info", XHS_FOLLOW_NA);
     return;
   }
   if (!HUB_ACC) { tbody.innerHTML = empty(3, "请先选择已登录账号", "i-user"); return; }
+  const state = FOLLOW_STATE[direction];
+  if (page != null) state.page = Math.max(1, Number(page || 1));
   try {
-    const list = await api(`/api/follows?account_id=${HUB_ACC}&direction=${direction}`);
+    const params = new URLSearchParams({ account_id: HUB_ACC, direction,
+      page: String(state.page), page_size: String(FOLLOW_PAGE_SIZE) });
+    if (state.query) params.set("query", state.query);
+    const payload = await api(`/api/follows?${params}`);
     if (!isCurrent()) return;
+    const list = payload.items || [];
     const badge = $(direction === "fan" ? "hb-fans" : "hb-following");
-    if (badge) badge.textContent = list.length;
+    if (badge && !state.query) badge.textContent = payload.total || 0;
     tbody.innerHTML = list.length ? list.map(f => followRow(f, direction)).join("")
-      : empty(3, direction === "fan" ? "暂无粉丝数据" : "暂无关注数据", "i-user", "点右上「同步」抓取");
+      : empty(3, state.query ? "没有匹配用户" : (direction === "fan" ? "暂无粉丝数据" : "暂无关注数据"), "i-user");
+    renderFollowPager(direction, payload);
+    refreshFollowSyncJob(direction);
   } catch (e) { if (!isCurrent()) return; tbody.innerHTML = empty(3, "加载失败:" + e.message, "i-info"); }
 }
 function followRow(f, direction) {
@@ -3117,22 +3242,42 @@ function followRow(f, direction) {
 async function syncFollows(direction) {
   if (PLATFORM === "xhs") { toast(XHS_FOLLOW_NA, "info", 6000); return; }
   if (!HUB_ACC) { toast("请先选择账号", "err"); return; }
-  await withBusy(evtBtn(), "同步中", async () => {
-    try { const r = await api(`/api/accounts/${HUB_ACC}/follows/sync?direction=${direction}`, { method: "POST" }); toast(`同步完成:抓到 ${r.fetched} 条,新增 ${r.added}`, "ok"); }
-    catch (e) { toast("同步失败:" + e.message, "err"); }
-  });
-  refreshFollows(direction);
+  let job = null;
+  try {
+    await withBusy(evtBtn(), "启动中", async () => {
+      job = await api(`/api/accounts/${HUB_ACC}/follows/sync-jobs?direction=${direction}`, { method: "POST" });
+    });
+  } catch (e) { toast("同步失败:" + e.message, "err"); return; }
+  renderFollowSyncStatus(direction, job);
+  toast(job.status === "queued" ? "同步任务已创建" : "同步任务正在运行", "info");
+  pollFollowSync(direction, job.id);
+}
+async function cancelFollowSync(direction) {
+  const jobId = FOLLOW_JOB_IDS[direction]; if (!jobId) return;
+  try {
+    const job = await api(`/api/follow-sync-jobs/${encodeURIComponent(jobId)}/cancel`, { method: "POST" });
+    renderFollowSyncStatus(direction, job);
+  } catch (e) { toast("取消失败:" + e.message, "err"); }
 }
 async function actFollow(action, edgeId) {
   // 取该行 follow 边的目标信息(从已渲染列表里拿)
   const accountId = HUB_ACC;
   const dir = HUB_TAB === "fans" ? "fan" : "following";
   let edge = null;
-  try { const list = await api(`/api/follows?account_id=${accountId}&direction=${dir}`); edge = list.find(x => x.id === edgeId); } catch (e) {}
+  try { edge = await api(`/api/follows/${edgeId}?account_id=${accountId}`); } catch (e) {}
   if (HUB_ACC !== accountId) return;
   if (!edge) { toast("找不到该用户,请重新同步", "err"); return; }
   const label = action === "unfollow" ? "取关" : "回关";
-  if (!await uiConfirm({ title: label + "确认", message: `确认对「${edge.nickname}」${label}?将打开浏览器窗口执行(有头窗口,可手动过验证码)。`, danger: action === "unfollow" })) return;
+  // Keep the confirmation flow usable in lightweight/offline embeds where
+  // the optional transport-matrix module has not been loaded yet.
+  const route = typeof transportRoute === "function"
+    ? transportRoute("douyin", "follow_write") : null;
+  const routeHint = route?.effective_mode === "api"
+    ? "将通过该账号的独立 API 会话执行，不会打开浏览器。"
+    : route?.effective_mode === "hybrid"
+      ? "将优先通过该账号的独立 API 会话执行；仅明确拒绝时回退账号浏览器。"
+      : "将打开该账号自己的浏览器 Profile 执行。";
+  if (!await uiConfirm({ title: label + "确认", message: `确认对「${edge.nickname}」${label}?${routeHint}`, danger: action === "unfollow" })) return;
   if (HUB_ACC !== accountId) { toast("账号已切换，本次操作已取消", "info"); return; }
   await withBusy(evtBtn(), label + "中", async () => {
     try {
@@ -3140,7 +3285,7 @@ async function actFollow(action, edgeId) {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ account_id: +accountId, action, target_uid: edge.uid, target_sec_uid: edge.sec_uid || "", target_nick: edge.nickname, run_now: true })
       });
-      toast(result.ran ? label + "成功" : `任务 #${result.id} 已保留：${result.execution_error || "等待队列执行"}`, result.ran ? "ok" : "info", 6000);
+      toast(result.ran ? `${label}成功${transportSourceSuffix(result.method)}` : `任务 #${result.id} 已保留：${result.execution_error || "等待队列执行"}`, result.ran ? "ok" : "info", 6000);
     } catch (e) { toast(label + "失败:" + e.message, "err"); }
   });
   if (HUB_ACC === accountId) refreshFollows(dir);
@@ -3214,6 +3359,7 @@ async function syncDm() {
 }
 async function openDmConv(convId) {
   DM_CONV = convId;
+  DM_NEW_TARGET = "";
   const isCurrent = beginViewRequest("open-dm-conv", () => `${HUB_ACC}:${DM_CONV}`);
   const accountId = HUB_ACC;
   document.querySelectorAll("#dm-convs .dm-conv").forEach(e => e.classList.toggle("active", e.dataset.conv === convId));
@@ -3227,6 +3373,39 @@ async function openDmConv(convId) {
   if (!isCurrent()) return;
   markDmRead(convId);
   await refreshDmMessages();
+}
+
+function normalizeDmTarget(value) {
+  let target = String(value || "").trim();
+  if (!target) return "";
+  try {
+    const url = new URL(target);
+    if (url.protocol !== "https:" || !/(^|\.)douyin\.com$/i.test(url.hostname)) return "";
+    const match = url.pathname.match(/\/user\/([^/?#]+)/);
+    if (!match) return "";
+    target = decodeURIComponent(match[1]);
+  } catch (_) {}
+  return target.replace(/^@/, "").trim();
+}
+
+async function startNewDm() {
+  if (!HUB_ACC) { toast("请先选择账号", "err"); return; }
+  if (PLATFORM !== "douyin") return;
+  const raw = await uiPrompt({
+    title: "发起新私信",
+    hint: "填写对方抖音号、主页链接或 sec_uid。抖音号会先精确解析为内部 UID。",
+    placeholder: "抖音号 / https://www.douyin.com/user/...",
+  });
+  if (raw === null) return;
+  const target = normalizeDmTarget(raw);
+  if (!target) { toast("目标用户不能为空", "err"); return; }
+  DM_CONV = null;
+  DM_NEW_TARGET = target;
+  document.querySelectorAll("#dm-convs .dm-conv").forEach(e => e.classList.remove("active"));
+  const thread = $("dm-thread");
+  if (thread) thread.innerHTML = `<div class="empty"><div class="empty-ic">${ic("i-send")}</div><div class="empty-t">新私信</div><div class="empty-sub">目标 ${esc(target)}</div></div>`;
+  const input = $("dm-input");
+  if (input) { input.placeholder = "输入第一条私信…"; input.focus(); }
 }
 
 function dmRuleSummary(rule) {
@@ -3364,21 +3543,39 @@ async function refreshDmMessages() {
 async function sendDm() {
   const inp = $("dm-input"); const text = (inp.value || "").trim();
   if (!HUB_ACC) { toast("请先选择账号", "err"); return; }
-  if (!DM_CONV) { toast("请先选择左侧会话", "err"); return; }
+  if (!DM_CONV && !DM_NEW_TARGET) { toast("请选择会话或点“新私信”", "err"); return; }
   if (!text) return;
   const c = DM_CONVS.find(x => x.conv_id === DM_CONV) || {};
-  const accountId = HUB_ACC, conversationId = DM_CONV;
+  const accountId = HUB_ACC, conversationId = DM_CONV, newTarget = DM_NEW_TARGET;
+  const numericTarget = /^\d+$/.test(newTarget);
   await withBusy(evtBtn(), "发送中", async () => {
     try {
       const result = await api("/api/account-actions", {
         method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ account_id: +accountId, action: "send_dm", target_uid: c.peer_uid || "", target_sec_uid: c.peer_sec_uid || "", target_nick: c.peer_nickname || "", conv_id: conversationId, content: text, run_now: true })
+        body: JSON.stringify({
+          account_id: +accountId, action: "send_dm",
+          target_uid: c.peer_uid || (numericTarget ? newTarget : ""),
+          target_sec_uid: c.peer_sec_uid || (!numericTarget ? newTarget : ""),
+          target_nick: c.peer_nickname || "", conv_id: conversationId || "",
+          content: text, run_now: true,
+        })
       });
       if (HUB_ACC === accountId && DM_CONV === conversationId && inp.value.trim() === text) inp.value = "";
       toast(result.ran ? "已发送" : `任务 #${result.id} 已保留：${result.execution_error || "等待队列发送"}`, result.ran ? "ok" : "info", 6000);
       // 发完重拉历史,展示刚发出的消息(imapi 有短暂延迟,稍等再拉)
       await new Promise(r => setTimeout(r, 700));
-      if (HUB_ACC === accountId && DM_CONV === conversationId) await openDmConv(conversationId);
+      if (HUB_ACC !== accountId || DM_CONV !== conversationId) return;
+      if (conversationId) await openDmConv(conversationId);
+      else {
+        await refreshDmConvs();
+        const created = DM_CONVS.find(row =>
+          String(row.peer_uid || "") === newTarget || String(row.peer_sec_uid || "") === newTarget);
+        if (created) {
+          DM_NEW_TARGET = "";
+          inp.placeholder = "输入私信内容…";
+          await openDmConv(created.conv_id);
+        }
+      }
     } catch (e) { toast("发送失败:" + e.message, "err"); }
   });
 }
@@ -3397,8 +3594,9 @@ function populateAccountSelect() {
 function populateCollectionAccount() {
   const sel = $("col-account"); if (!sel) return;
   const current = sel.value;
-  const list = ACCOUNTS.filter(a => a.platform === "douyin" && a.status !== "invalid" && a.has_storage);
-  sel.innerHTML = accOptions(list, list.length ? "请选择抖音账号" : "暂无可用抖音账号");
+  const platformName = PF_NAME[PLATFORM] || "平台";
+  const list = ACCOUNTS.filter(a => a.platform === PLATFORM && a.status !== "invalid" && a.has_storage);
+  sel.innerHTML = accOptions(list, list.length ? `请选择${platformName}账号` : `暂无可用${platformName}账号`);
   if (list.some(a => String(a.id) === current)) sel.value = current;
   else if (list.length) sel.value = String(list[0].id);
   if (sel._csSync) sel._csSync();
@@ -4112,9 +4310,73 @@ async function delAccount(id) {
   catch (e) { toast("删除失败:" + e.message, "err"); }
 }
 
+// ─── API 兼容矩阵 / 多账号环境隔离 ───
+let TRANSPORT_MATRIX = null;
+function transportModeLabel(mode) {
+  return ({ api: "API 直连", browser: "浏览器", hybrid: "API → 浏览器回退",
+    manual: "人工草稿", unavailable: "当前不可用", deferred: "已暂缓" })[mode] || mode || "未知";
+}
+function transportModeTag(mode) {
+  const safe = ["api", "browser", "hybrid", "manual", "unavailable", "deferred"].includes(mode) ? mode : "manual";
+  return `<span class="transport-mode ${safe}">${esc(transportModeLabel(mode))}</span>`;
+}
+function transportSupportTag(enabled, label) {
+  return enabled
+    ? `<span class="pill done bare">${esc(label)}可用</span>`
+    : `<span class="pill skipped bare">${esc(label)}—</span>`;
+}
+function transportRoute(platform, operation) {
+  return TRANSPORT_MATRIX?.rows?.find(row => row.platform === platform && row.operation === operation) || null;
+}
+function transportSourceSuffix(source) {
+  const labels = { api: "API 直连", web_api: "API 直连", browser: "浏览器",
+    browser_fallback: "浏览器回退", api_browser_context: "浏览器上下文 API" };
+  return labels[source] ? ` · ${labels[source]}` : "";
+}
+function renderTransportMatrix(data) {
+  const body = $("transport-matrix-body"), isolation = $("transport-isolation-body");
+  if (!body || !isolation) return;
+  const platformNames = { douyin: "抖音", xhs: "小红书", kuaishou: "快手", shipinhao: "视频号" };
+  const rows = Array.isArray(data?.rows) ? data.rows : [];
+  body.innerHTML = rows.length ? rows.map(row => `<tr>
+    <td><b>${esc(platformNames[row.platform] || row.platform)}</b></td>
+    <td>${esc(row.label || row.operation)}</td>
+    <td>${transportSupportTag(!!row.api, "API")}</td>
+    <td>${transportSupportTag(!!row.browser, "浏览器")}</td>
+    <td>${transportModeTag(row.effective_mode)}${row.configured_mode !== row.effective_mode ? `<div class="isolation-note">配置：${esc(transportModeLabel(row.configured_mode))}</div>` : ""}</td>
+    <td>${esc(row.reason || row.note || (row.fallback === "browser_on_confirmed_failure" ? "明确失败时回退；不确定写结果不重试" : "—"))}</td>
+  </tr>`).join("") : empty(6, "尚无兼容矩阵", "i-info");
+  const accounts = Array.isArray(data?.accounts) ? data.accounts : [];
+  isolation.innerHTML = accounts.length ? accounts.map(account => {
+    const badge = (ok, yes, no) => `<span class="pill ${ok ? "done" : "pending"} bare">${esc(ok ? yes : no)}</span>`;
+    return `<tr>
+      <td><b>${esc(account.nickname || `账号 #${account.account_id}`)}</b><div class="isolation-note">${esc(platformNames[account.platform] || account.platform)} · #${Number(account.account_id) || "-"}</div></td>
+      <td>${badge(account.profile_isolated, "独立", "缺失/重复")}</td>
+      <td><div class="isolation-stack">${badge(account.credential_isolated, "登录态独立", "登录态待检查")}${badge(account.api_session_isolated, "会话独立", "会话共享")}${badge(account.api_environment_aligned, "参数对齐", "参数未对齐")}</div></td>
+      <td>${badge(account.network_isolated, "专属代理", account.network_scope || "共享出口")}</td>
+      <td><code>${esc(account.environment_id || "-")}</code>${account.warnings?.length ? `<div class="isolation-note">${account.warnings.map(esc).join("；")}</div>` : ""}</td>
+    </tr>`;
+  }).join("") : empty(5, "尚未添加账号", "i-user");
+}
+async function refreshTransportMatrix() {
+  const status = $("transport-matrix-status");
+  try {
+    const data = await api("/api/settings/transport-matrix");
+    TRANSPORT_MATRIX = data;
+    renderTransportMatrix(data);
+    if (status) status.textContent = `已核对 ${data.rows?.length || 0} 项能力、${data.accounts?.length || 0} 个账号环境`;
+    return data;
+  } catch (error) {
+    if (status) status.textContent = "兼容矩阵读取失败：" + error.message;
+    return null;
+  }
+}
+globalThis.CreatorHubTransportMatrix = { load: refreshTransportMatrix, route: transportRoute };
+
 // ─── 下载设置 ───
 async function loadSettings() {
   globalThis.CreatorHubEngineSettings?.load();
+  refreshTransportMatrix();
   try {
     const s = await api("/api/settings");
     const assign = (id, property, value) => {
@@ -4804,7 +5066,7 @@ async function toggleChannel(id, enabled) { try { await api("/api/notifications/
 async function delChannel(id) { if (await uiConfirm({ title: "删除渠道", message: "删除该通知渠道?", okText: "删除", danger: true })) { try { await api("/api/notifications/" + id, { method: "DELETE" }); toast("渠道已删除", "ok"); refreshChannels(); } catch (e) { toast("删除失败:" + e.message, "err"); } } }
 
 // ─── 监控 ───
-// ═══════════ 关键词批量采集（当前版本：抖音）═══════════
+// ═══════════ 抖音 / 小红书关键词批量采集 ═══════════
 function parseCollectionKeywords(raw) {
   const seen = new Set();
   return String(raw || "")
@@ -4820,6 +5082,15 @@ function collectionKeywords() {
 function applyCollectionForm() {
   const enabled = !!($("col-download") && $("col-download").checked);
   if ($("col-dir-wrap")) $("col-dir-wrap").style.display = enabled ? "" : "none";
+  const xhs = PLATFORM === "xhs";
+  if ($("collection-create-title")) $("collection-create-title").textContent = `新建${xhs ? "小红书" : "抖音"}关键词采集`;
+  if ($("collection-create-sub")) $("collection-create-sub").textContent = xhs ? "批量搜索笔记并抓取评论" : "批量搜索视频并抓取评论";
+  if ($("col-page-help")) $("col-page-help").textContent = xhs ? "一页对应一次搜索结果下滑或接口翻页。" : "一页对应一次搜索结果下滑。";
+  if ($("col-replies-help")) $("col-replies-help").textContent = `采集${xhs ? "小红书" : "抖音"}当前可返回的回复`;
+  if ($("collection-callout-title")) $("collection-callout-title").textContent = "作品上限、采集深度和停止条件任一满足即结束";
+  if ($("collection-callout-copy")) $("collection-callout-copy").textContent = xhs
+    ? "小红书采集复用所选账号的可见浏览器或显式 API 读取模式；最新、类型、时间和数据门槛会在入库前复核；任务串行执行，可随时取消，已入库结果会保留。"
+    : "抖音采集会临时打开可见浏览器窗口；平台筛选后还会在本地复核类型、时间和数据门槛；任务串行执行，可随时取消，已入库结果会保留。";
 }
 function collectionStatus(status) {
   const labels = { pending: "等待中", running: "采集中", done: "已完成", partial: "部分完成", failed: "失败", canceled: "已取消" };
@@ -4865,7 +5136,7 @@ async function createCollection() {
       const job = await api("/api/collections", {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          platform: "douyin", account_id: accountId, keywords,
+          platform: PLATFORM, account_id: accountId, keywords,
           max_contents_per_keyword: contentLimit,
           max_pages_per_keyword: pageLimit,
           stagnant_pages: stagnantPages,
@@ -4912,7 +5183,7 @@ function renderCollectionJobs() {
       ((job.keywords || []).length > 5 ? `<span class="meta-chip more">+${job.keywords.length - 5}</span>` : "");
     const canCancel = ["pending", "running"].includes(job.status);
     const canRetry = ["done", "partial", "failed", "canceled"].includes(job.status);
-    const canEdit = canRetry && job.platform === "douyin";
+    const canEdit = canRetry && ["douyin", "xhs"].includes(job.platform);
     const errorText = collectionLastError(job);
     const sortLabel = { general: "综合", latest: "最新", most_liked: "最多点赞" }[job.search_sort] || "综合";
     const timeLabel = { all: "不限时间", day: "一天内", week: "一周内", half_year: "半年内" }[job.publish_time] || "不限时间";
@@ -4937,9 +5208,9 @@ function renderCollectionJobs() {
 }
 async function refreshCollections() {
   const isCurrent = beginViewRequest("collections");
-  if (!$("collection-job-table") || PLATFORM !== "douyin") return;
+  if (!$("collection-job-table") || !["douyin", "xhs"].includes(PLATFORM)) return;
   try {
-    const jobs = await api("/api/collections?platform=douyin");
+    const jobs = await api("/api/collections?platform=" + encodeURIComponent(PLATFORM));
     if (!isCurrent()) return;
     COLLECTION_JOBS = jobs;
     const active = COLLECTION_JOBS.filter(j => ["pending", "running"].includes(j.status)).length;
@@ -4960,7 +5231,8 @@ async function refreshCollections() {
 async function editCollection(jobId, draft = null) {
   const job = COLLECTION_JOBS.find(item => item.id === Number(jobId));
   if (!job) return;
-  const accounts = ACCOUNTS.filter(a => a.platform === "douyin" && a.status !== "invalid" && a.has_storage);
+  const platformName = PF_NAME[job.platform] || "平台";
+  const accounts = ACCOUNTS.filter(a => a.platform === job.platform && a.status !== "invalid" && a.has_storage);
   const initial = draft || {
     account_id: job.account_id,
     keywords: (job.keywords || []).join("\n"),
@@ -4985,8 +5257,8 @@ async function editCollection(jobId, draft = null) {
       <div class="form-field"><label for="ecol-keywords">关键词 <span class="field-scope">最多 20 个</span></label>
         <textarea id="ecol-keywords" rows="5" placeholder="每行一个关键词">${esc(initial.keywords)}</textarea></div>
       <div class="form-grid">
-        <div class="form-field"><label for="ecol-account">使用账号</label><select id="ecol-account">${accOptions(accounts, accounts.length ? "请选择抖音账号" : "暂无可用抖音账号")}</select></div>
-        <div class="form-field"><label for="ecol-quality">视频画质</label><select id="ecol-quality"><option value="highest">原画 / 最高</option><option value="1080">1080P</option><option value="720">720P</option><option value="540">540P</option><option value="lowest">最低省流</option></select></div>
+        <div class="form-field"><label for="ecol-account">使用账号</label><select id="ecol-account">${accOptions(accounts, accounts.length ? `请选择${platformName}账号` : `暂无可用${platformName}账号`)}</select></div>
+        ${job.platform === "douyin" ? '<div class="form-field"><label for="ecol-quality">视频画质</label><select id="ecol-quality"><option value="highest">原画 / 最高</option><option value="1080">1080P</option><option value="720">720P</option><option value="540">540P</option><option value="lowest">最低省流</option></select></div>' : ""}
         <div class="form-field"><label for="ecol-content-limit">每词作品上限</label><input id="ecol-content-limit" type="number" min="1" max="100" value="${Number(initial.max_contents_per_keyword) || 20}"></div>
         <div class="form-field"><label for="ecol-comment-limit">每作品评论上限</label><input id="ecol-comment-limit" type="number" min="0" max="200" value="${Number(initial.max_comments_per_content) || 0}"></div>
       </div>
@@ -5005,12 +5277,12 @@ async function editCollection(jobId, draft = null) {
       <fieldset class="ui-form-group"><legend>评论与下载</legend>
       <div class="option-grid" aria-label="采集选项">
         <label class="switch-row"><input type="checkbox" id="ecol-download"${initial.download_media ? " checked" : ""} onchange="$('ecol-dir-wrap').style.display=this.checked?'':'none'"><span class="switch-copy"><b>下载媒体</b><span>保存视频和封面来源</span></span></label>
-        <label class="switch-row"><input type="checkbox" id="ecol-replies"${initial.include_replies ? " checked" : ""}><span class="switch-copy"><b>包含二级评论</b><span>采集抖音当前可返回的回复</span></span></label>
+        <label class="switch-row"><input type="checkbox" id="ecol-replies"${initial.include_replies ? " checked" : ""}><span class="switch-copy"><b>包含二级评论</b><span>采集${platformName}当前可返回的回复</span></span></label>
       </div>
       <div class="form-field" id="ecol-dir-wrap" style="display:${initial.download_media ? "" : "none"}"><label for="ecol-download-dir">下载目录（可选）</label><input id="ecol-download-dir" value="${esc(initial.download_dir)}" placeholder="留空使用默认目录"></div>
       </fieldset>`;
     $("ecol-account").value = String(initial.account_id || "");
-    $("ecol-quality").value = initial.video_quality || "highest";
+    if ($("ecol-quality")) $("ecol-quality").value = initial.video_quality || "highest";
     $("ecol-sort").value = initial.search_sort || "general";
     $("ecol-publish-time").value = initial.publish_time || "all";
     $("ecol-content-type").value = initial.content_type || "all";
@@ -5029,7 +5301,7 @@ async function editCollection(jobId, draft = null) {
       max_comments_per_content: Number($("ecol-comment-limit").value || 0),
       include_replies: $("ecol-replies").checked,
       download_media: $("ecol-download").checked,
-      video_quality: $("ecol-quality").value || "highest",
+      video_quality: $("ecol-quality") ? ($("ecol-quality").value || "highest") : "highest",
       download_dir: $("ecol-download-dir").value.trim(),
     });
     _uiOpen(`编辑采集任务 #${job.id}`, "已有作品和评论会保留。保存后点击「续跑」应用新配置，系统会自动去重。", {
@@ -5038,14 +5310,14 @@ async function editCollection(jobId, draft = null) {
         const keywords = parseCollectionKeywords(value.keywords);
         if (!keywords.length) uiEditorError("请至少填写一个关键词", "ecol-keywords");
         if (keywords.length > 20) uiEditorError("单个任务最多 20 个关键词", "ecol-keywords");
-        if (!value.account_id) uiEditorError("请选择一个可用抖音账号", "ecol-account");
+        if (!value.account_id) uiEditorError(`请选择一个可用${platformName}账号`, "ecol-account");
         if (value.max_contents_per_keyword < 1 || value.max_contents_per_keyword > 100) uiEditorError("每词作品上限须为 1–100", "ecol-content-limit");
         if (value.max_pages_per_keyword < 1 || value.max_pages_per_keyword > 40) uiEditorError("每词采集深度须为 1–40 页", "ecol-page-limit");
         if (value.stagnant_pages < 1 || value.stagnant_pages > 8) uiEditorError("连续无新增停止阈值须为 1–8 页", "ecol-stagnant-pages");
         if (value.min_likes < 0 || value.min_comments < 0) uiEditorError("点赞和评论门槛须为非负整数", "ecol-min-likes");
         if (value.max_comments_per_content < 0 || value.max_comments_per_content > 200) uiEditorError("每作品评论上限须为 0–200", "ecol-comment-limit");
         return api(`/api/collections/${job.id}`, {
-          method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ...value, platform: "douyin", keywords }),
+          method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ...value, platform: job.platform, keywords }),
         });
       },
     });
@@ -5275,7 +5547,7 @@ async function addMonitor() {
         body: JSON.stringify({
           url_or_secuid, platform: PLATFORM, target_kind,
           account_id: $("t-acc").value ? +$("t-acc").value : null,
-          interval_seconds: +$("t-interval").value,
+          interval_seconds: monitorIntervalSeconds("t-interval"),
           initial_backfill_count: PLATFORM === "douyin"
             ? ($("t-backfill").value === "" ? null : +$("t-backfill").value) : 0,
           download_dir: $("t-dir").value.trim(),
@@ -5311,6 +5583,78 @@ function numericSelectOptions(current, choices, unit = "") {
   return rows.map(([value, label]) =>
     `<option value="${value}">${esc(label)}</option>`).join("");
 }
+function monitorIntervalText(seconds) {
+  let left = Number(seconds);
+  if (!Number.isFinite(left) || left <= 0) return "—";
+  const parts = [];
+  for (const [size, unit] of [[86400, "天"], [3600, "小时"], [60, "分钟"]]) {
+    const count = Math.floor(left / size);
+    if (count) parts.push(`${count} ${unit}`);
+    left %= size;
+  }
+  if (left) parts.push(`${left} 秒`);
+  return parts.join(" ");
+}
+function monitorIntervalOptions(current, allowGlobal = false) {
+  const choices = [1, 5, 10, 15, 30, 60, 300, 600, 1800, 3600, 21600, 86400]
+    .map(seconds => [seconds, `每 ${monitorIntervalText(seconds)}`]);
+  if (allowGlobal) choices.unshift([0, "跟随全局设置"]);
+  const selected = choices.some(([seconds]) => seconds === Number(current)) ? String(current) : "custom";
+  choices.push(["custom", "自定义…"]);
+  return choices.map(([value, label]) =>
+    `<option value="${value}"${String(value) === selected ? " selected" : ""}>${esc(label)}</option>`).join("");
+}
+function setupMonitorInterval(id, seconds, allowGlobal = false) {
+  const select = $(id);
+  select.innerHTML = monitorIntervalOptions(seconds, allowGlobal);
+  select.dataset.allowGlobalInterval = String(allowGlobal);
+  select.insertAdjacentHTML("afterend", `<div id="${id}-custom" class="monitor-interval-custom" hidden>
+    <div class="form-field"><label for="${id}-amount">间隔数值</label>
+      <input id="${id}-amount" type="number" inputmode="decimal" required aria-describedby="${id}-custom-help"></div>
+    <div class="form-field"><label for="${id}-unit">时间单位</label>
+      <select id="${id}-unit"><option value="1">秒</option><option value="60">分钟</option></select></div>
+    <p id="${id}-custom-help" class="field-help">范围 1–86400 秒；分钟支持小数，换算后须为整秒。</p>
+  </div>`);
+  const amount = $(id + "-amount"), unit = $(id + "-unit"), custom = $(id + "-custom");
+  const initial = seconds > 0 ? seconds : 300;
+  let previousScale = initial % 60 === 0 ? 60 : 1;
+  unit.value = String(previousScale); amount.value = String(initial / previousScale);
+  const sync = () => {
+    const active = select.value === "custom", scale = Number(unit.value);
+    custom.hidden = !active; amount.disabled = unit.disabled = !active;
+    amount.min = String(1 / scale); amount.max = String(86400 / scale);
+    amount.step = scale === 1 ? "1" : "any";
+    previousScale = scale;
+    setFieldError(amount, "");
+    unit._csSync?.(); select._csSync?.();
+  };
+  select._monitorIntervalSync = sync;
+  select.addEventListener("change", sync);
+  unit.addEventListener("change", () => {
+    if (amount.value.trim() && Number.isFinite(Number(amount.value))) {
+      amount.value = String(Number(amount.value) * previousScale / Number(unit.value));
+    }
+    sync();
+  });
+  amount.addEventListener("input", () => setFieldError(amount, ""));
+  sync();
+}
+function monitorIntervalSeconds(id) {
+  const select = $(id), custom = select.value === "custom";
+  const input = custom ? $(id + "-amount") : select;
+  const raw = input.value.trim();
+  const scale = custom ? Number($(id + "-unit").value) : 1;
+  const seconds = Number(raw) * scale, rounded = Math.round(seconds);
+  if (!custom && raw === "0" && select.dataset.allowGlobalInterval === "true") return 0;
+  if (!raw || ![1, 60].includes(scale) || !Number.isFinite(seconds)
+      || rounded < 1 || rounded > 86400 || Math.abs(seconds - rounded) > 1e-6) {
+    const message = "请输入 1–86400 秒的间隔，换算后须为整秒";
+    setFieldError(input, message); input.focus();
+    uiEditorError(message, input.id);
+  }
+  setFieldError(input, "");
+  return rounded;
+}
 async function editMonitor(id) {
   const item = monitorById(id); if (!item) return;
   const accounts = ACCOUNTS.filter(a => a.platform === item.platform && a.status !== "invalid");
@@ -5318,10 +5662,7 @@ async function editMonitor(id) {
     `<option value="">${item.account_id ? "保持当前绑定" : "不指定账号"}</option>`,
     ...accounts.map(a => `<option value="${a.id}">${esc(a.nickname)}${a.has_creator ? " · 创作号" : ""}</option>`),
   ].join("");
-  const intervalOptions = numericSelectOptions(item.interval_seconds || 300, [
-    [60, "每 1 分钟"], [300, "每 5 分钟"], [600, "每 10 分钟"],
-    [1800, "每 30 分钟"], [3600, "每小时"], [21600, "每 6 小时"], [86400, "每天"],
-  ], " 秒");
+  const intervalOptions = monitorIntervalOptions(item.interval_seconds || 300);
   const backfillOptions = numericSelectOptions(item.initial_backfill_count ?? 0, [
     [0, "不回填历史"], [5, "最近 5 条"], [20, "最近 20 条"], [-1, "尽可能全量"],
   ], " 条");
@@ -5341,7 +5682,7 @@ async function editMonitor(id) {
         alias: $("em-alias").value.trim(),
         group_name: getMetaValue("em-group").trim(),
         tags: parseTags(getMetaValue("em-tags")),
-        interval_seconds: +$("em-interval").value,
+        interval_seconds: monitorIntervalSeconds("em-interval"),
         account_id: $("em-account").value ? +$("em-account").value : null,
         download_dir: $("em-dir").value.trim(),
         video_quality: $("em-quality") ? $("em-quality").value : "",
@@ -5405,7 +5746,7 @@ async function editMonitor(id) {
       </fieldset>`;
     enhanceMetaControl($("em-group"), "group"); enhanceMetaControl($("em-tags"), "tags");
     setMetaValue("em-group", item.group_name || ""); setMetaValue("em-tags", itemTags(item).join(","));
-    $("em-interval").value = String(item.interval_seconds || 300);
+    setupMonitorInterval("em-interval", item.interval_seconds || 300);
     $("em-account").value = item.account_id ? String(item.account_id) : "";
     if ($("em-backfill")) $("em-backfill").value = String(item.initial_backfill_count ?? 0);
     if ($("em-quality")) $("em-quality").value = item.video_quality || "";
@@ -5458,7 +5799,7 @@ function monRow(t) {
     <td><div class="user-cell">${t.avatar ? `<img class="avatar" src="${esc(safeMediaUrl(t.avatar))}" alt="" referrerpolicy="no-referrer">` : ""}<div><span>${label}</span>${t.alias ? `<div class="alias-line">${esc(t.alias)}</div>` : ""}${accTag}</div></div></td>
     <td>${metaChips(t)}</td>
     <td class="num"><button type="button" class="ghost sm monitor-record-link" data-monitor-records="${t.id}" onclick="showMonitorRecords(${t.id})">查看记录 <span>${t.content_count || 0}</span></button></td>
-    <td class="num">${Math.round(t.interval_seconds / 60)} 分</td>
+    <td class="num">${monitorIntervalText(t.interval_seconds)}</td>
     <td class="wrap" style="max-width:230px">
       <div style="display:flex;gap:4px;flex-wrap:wrap;margin-bottom:4px"><span class="pill q bare">${downloadLabel}</span></div>
       ${monitorStrategySummary(t)}
@@ -5863,8 +6204,8 @@ function danmakuWatchRow(w) {
     ? '<img class="avatar" src="' + esc(w.avatar) + '" referrerpolicy="no-referrer">' : "";
   const alias = w.alias ? '<div class="alias-line">' + esc(w.alias) + "</div>" : "";
   const interval = w.interval_seconds
-    ? Math.round(w.interval_seconds / 60) + " 分"
-    : "跟随全局" + (w.effective_interval_seconds ? "（" + Math.round(w.effective_interval_seconds / 60) + " 分）" : "");
+    ? monitorIntervalText(w.interval_seconds)
+    : "跟随全局" + (w.effective_interval_seconds ? "（" + monitorIntervalText(w.effective_interval_seconds) + "）" : "");
   const scope = w.kind === "user"
     ? '<div class="mut" style="font-size:11px;margin-top:2px">' +
       (w.recent_works ? "近 " + w.recent_works + " 个" : "全局 " + (w.effective_recent_works || "") + " 个") +
@@ -5925,7 +6266,7 @@ async function addDanmakuWatch() {
         body: JSON.stringify({
           url_or_id: url, platform: "douyin", kind: $("d-w-kind").value, mode: mode,
           account_id: $("d-w-acc").value ? +$("d-w-acc").value : null,
-          interval_seconds: +$("d-w-interval").value,
+          interval_seconds: monitorIntervalSeconds("d-w-interval"),
           recent_works: +$("d-w-recent").value, recent_days: +$("d-w-days").value,
           max_scrolls: +$("d-w-depth").value, alias: $("d-w-alias").value.trim(),
           time_start_ms: Math.round(Math.max(0, +$("d-w-time-start").value || 0) * 1000),
@@ -5974,10 +6315,7 @@ function onDanmakuSrc() {
 async function editDanmakuWatch(id) {
   const item = DANMAKU_WATCHES.find(x => x.id === id);
   if (!item) return;
-  const intervalOptions = numericSelectOptions(item.interval_seconds || 0, [
-    [0, "跟随全局设置"], [60, "每 1 分钟"], [300, "每 5 分钟"],
-    [600, "每 10 分钟"], [1800, "每 30 分钟"], [3600, "每小时"], [86400, "每天"],
-  ]);
+  const intervalOptions = monitorIntervalOptions(item.interval_seconds || 0, true);
   const recentOptions = numericSelectOptions(item.recent_works || 0, [
     [0, "跟随全局设置"], [3, "最近 3 个作品"], [5, "最近 5 个作品"],
     [10, "最近 10 个作品"], [20, "最近 20 个作品"], [50, "最近 50 个作品"],
@@ -5995,7 +6333,7 @@ async function editDanmakuWatch(id) {
   const value = await new Promise(res => {
     _uiResolve = res; _uiCancelVal = null;
     _uiGetVal = () => ({
-      interval_seconds: +$("edw-interval").value,
+      interval_seconds: monitorIntervalSeconds("edw-interval"),
       recent_works: +$("edw-recent").value,
       recent_days: +$("edw-days").value,
       max_scrolls: +$("edw-depth").value,
@@ -6039,10 +6377,10 @@ async function editDanmakuWatch(id) {
         <div><label class="field" for="edw-include">包含关键词</label><input id="edw-include" value="${esc((item.include_keywords || []).join(","))}" placeholder="逗号分隔，命中任一项才保留"></div>
         <div><label class="field" for="edw-exclude">排除关键词</label><input id="edw-exclude" value="${esc((item.exclude_keywords || []).join(","))}" placeholder="逗号分隔，命中任一项则丢弃"></div>
       </fieldset>`;
+    setupMonitorInterval("edw-interval", item.interval_seconds || 0, true);
     ["edw-interval", "edw-recent", "edw-days", "edw-depth", "edw-probe"].forEach(key => {
       const el = $(key); if (el) enhanceSelect(el);
     });
-    $("edw-interval").value = String(item.interval_seconds || 0);
     $("edw-recent").value = String(item.recent_works || 0);
     $("edw-days").value = String(item.recent_days || 0);
     $("edw-depth").value = String(item.max_scrolls || 0);
@@ -6242,7 +6580,7 @@ async function addWatch() {
           url_or_id, platform: PLATFORM, kind: $("w-kind").value,
           mode: PLATFORM === "xhs" ? "public" : $("w-mode").value,
           account_id: $("w-acc").value ? +$("w-acc").value : null,
-          interval_seconds: +$("w-interval").value,
+          interval_seconds: monitorIntervalSeconds("w-interval"),
           recent_works: +$("w-recent").value,
           recent_days: +$("w-days").value,
           max_scrolls: +$("w-depth").value,
@@ -6268,7 +6606,7 @@ function watchRow(w) {
     <td>${w.kind === "video" ? (w.platform === "xhs" ? "笔记" : "视频") : (w.platform === "xhs" ? "创作者" : "账号")}</td>
     <td>${w.platform === "xhs" ? "公开" : (SRC[w.mode] || w.mode)}</td>
     <td class="num"><button type="button" class="ghost sm monitor-record-link" data-comment-records="${w.id}" onclick="showWatchRecords('comment',${w.id})">查看记录 <span>${fmtNum(w.comment_count || 0)}</span></button></td>
-    <td class="num">${Math.round(w.interval_seconds / 60)} 分
+    <td class="num">${monitorIntervalText(w.interval_seconds)}
       ${w.kind === "user" && (w.recent_works || w.recent_days) ? `<div class="mut" style="font-size:11px">${w.recent_works ? `近 ${w.recent_works} 个` : "全局作品数"} · ${w.recent_days ? `${w.recent_days} 天` : "全局天数"}</div>` : ""}</td>
     <td class="mut">${w.last_scan_at ? new Date(w.last_scan_at + "Z").toLocaleString() : "—"}${w.last_error ? ` <span class="warn-ic" title="${esc(w.last_error)}">${ic("i-info")}</span>` : ""}${autoRunHint(w.next_auto_run_at)}</td>
     <td><span class="pill ${w.enabled ? "active" : "paused"}">${w.enabled ? "监控中" : "已暂停"}</span></td>
@@ -6309,10 +6647,7 @@ async function editWatchMeta(id) {
     `<option value="">${item.account_id ? "保持当前绑定" : "不指定账号"}</option>`,
     ...accounts.map(a => `<option value="${a.id}">${esc(a.nickname)}${a.has_creator ? " · 创作号" : ""}</option>`),
   ].join("");
-  const intervalOptions = numericSelectOptions(item.interval_seconds || 600, [
-    [60, "每 1 分钟"], [300, "每 5 分钟"], [600, "每 10 分钟"],
-    [1800, "每 30 分钟"], [3600, "每小时"], [21600, "每 6 小时"], [86400, "每天"],
-  ], " 秒");
+  const intervalOptions = monitorIntervalOptions(item.interval_seconds || 600);
   const recentOptions = numericSelectOptions(item.recent_works || 0, [
     [0, "跟随全局设置"], [3, "最近 3 个作品"], [5, "最近 5 个作品"],
     [10, "最近 10 个作品"], [20, "最近 20 个作品"], [50, "最近 50 个作品"],
@@ -6331,7 +6666,7 @@ async function editWatchMeta(id) {
       alias: $("ew-alias").value.trim(),
       group_name: getMetaValue("ew-group").trim(),
       tags: parseTags(getMetaValue("ew-tags")),
-      interval_seconds: +$("ew-interval").value,
+      interval_seconds: monitorIntervalSeconds("ew-interval"),
       account_id: $("ew-account").value ? +$("ew-account").value : null,
       mode: $("ew-mode").value,
       recent_works: $("ew-recent") ? +$("ew-recent").value : item.recent_works || 0,
@@ -6366,7 +6701,7 @@ async function editWatchMeta(id) {
       </fieldset>`;
     enhanceMetaControl($("ew-group"), "group"); enhanceMetaControl($("ew-tags"), "tags");
     setMetaValue("ew-group", item.group_name || ""); setMetaValue("ew-tags", itemTags(item).join(","));
-    $("ew-interval").value = String(item.interval_seconds || 600);
+    setupMonitorInterval("ew-interval", item.interval_seconds || 600);
     $("ew-account").value = item.account_id ? String(item.account_id) : "";
     $("ew-mode").value = canCreator ? (item.mode || "public") : "public";
     if ($("ew-recent")) $("ew-recent").value = String(item.recent_works || 0);
@@ -7681,6 +8016,9 @@ PLATFORM = (() => { try { const p = localStorage.getItem("dym-pf"); return ["xhs
 applyPlatformUI();
 updateTaskQueuePlatformLabel();
 
+setupMonitorInterval("t-interval", 300);
+setupMonitorInterval("w-interval", 600);
+setupMonitorInterval("d-w-interval", 0, true);
 onTypeChange(); bindPubFilePicker(); onPubType(); populateWatchAccount(); applyDanmakuForm(); onAcMode(); loadSettings(); refreshAccounts(); refreshBrowserRuntimes(); refreshProxies(); refreshChannels(); loop();
 enhanceAllSelects();   // 把所有原生 <select> 升级为美化下拉
 enhanceAllMetaControls(); // 分组/标签：当前平台词库下拉，可搜索并新增

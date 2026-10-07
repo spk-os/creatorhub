@@ -17,7 +17,7 @@ from contextlib import asynccontextmanager
 from ipaddress import ip_address
 from pathlib import Path
 from typing import Any, Dict
-from urllib.parse import urlsplit
+from urllib.parse import urlencode, urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from datetime import date, datetime, time, timedelta, timezone
@@ -27,7 +27,7 @@ from fastapi import Body, FastAPI, HTTPException, Request, UploadFile, File
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field as PydanticField, StrictInt, ValidationError
-from sqlalchemy import func, or_, update
+from sqlalchemy import delete, func, or_, update
 from sqlmodel import select
 
 from .browser import (BrowserManager, cookie_string_to_state,
@@ -40,7 +40,7 @@ from .browser import (BrowserManager, cookie_string_to_state,
                       fetch_ks_self_profile,
                       fetch_channels_self_profile,
                       fetch_account_works, fetch_follows, fetch_dm_conversations,
-                      fetch_dm_history)
+                      fetch_dm_history, fetch_douyin_account_works_api)
 from .browser.backends import (
     ACCOUNT_BROWSER_BACKENDS, LOCAL_BACKEND, fingerprint_seed_u32,
     parse_extra_launch_args,
@@ -112,6 +112,11 @@ from .risk_admin import (RiskSettingsError, apply_risk_settings,
 from .settings import get_setting, set_setting
 from .engine_settings import (EngineSettingsPatch, export_engine_settings,
                               load_persisted_engine_settings, save_engine_settings)
+from .transport_matrix import (
+    build_transport_matrix,
+    douyin_client_environment,
+    resolve_transport,
+)
 from .scheduling import parse_schedule, utc_iso
 from .engine.cadence import row_deadline
 from .local_access import LocalAccessMiddleware
@@ -132,6 +137,8 @@ login_tasks: Dict[str, dict] = {}
 open_browsers: Dict[int, Any] = {}
 _file_manager_lock = threading.Lock()
 _share_download_sem = asyncio.Semaphore(2)
+_follow_sync_jobs: Dict[str, dict] = {}
+_follow_sync_tasks: Dict[str, asyncio.Task] = {}
 
 
 _ACTIVE_LOGIN_STATUSES = {"opening", "waiting", "verification", "persisted"}
@@ -532,6 +539,12 @@ async def lifespan(app: FastAPI):
     if callable(publisher):
         engine.set_dm_event_sink(publisher)
     yield
+    follow_tasks = [task for task in _follow_sync_tasks.values()
+                    if not task.done()]
+    for task in follow_tasks:
+        task.cancel()
+    if follow_tasks:
+        await asyncio.gather(*follow_tasks, return_exceptions=True)
     if im_receiver:
         await im_receiver.stop_all()
     if engine:
@@ -664,14 +677,23 @@ async def _enrich_account_profile(account_id: int, state: str, *,
     def _done(status: str, error=""):
         return (status, error) if detailed else status
 
-    if browser is None or not state:
+    if not state:
         return _done("error", "error")
     with get_session() as s:
         a0 = s.get(DouyinAccount, account_id)
-        platform = a0.platform if a0 else "douyin"
+        if not a0:
+            return _done("error", "error")
+        platform = a0.platform
         creator_state = a0.creator_storage_state if a0 else ""
         proxy = (a0.proxy or "") if a0 else ""
-        identity = browser.identity_for(a0) if a0 else browser.anon_identity()
+        dy_transport = (resolve_transport(cfg, "douyin", "account_profile", a0)
+                        if platform == "douyin" else None)
+        identity = (None if dy_transport and
+                    dy_transport["effective_mode"] == "api"
+                    else browser.identity_for(a0) if browser is not None else None)
+
+    if platform != "douyin" and browser is None:
+        return _done("error", "browser_unavailable")
 
     # XHS 创作者号:用创作平台「我的信息」拿资料 + 判活(www 接口对创作态拿不到)
     if platform == "xhs" and creator_state:
@@ -749,7 +771,34 @@ async def _enrich_account_profile(account_id: int, state: str, *,
             # 单次打开被重定向到登录页不能立即把刚添加的账号判为失效。
             u, err = await _fetch_channels_profile_with_retry(identity)
         else:
-            u, err = await fetch_self_profile(browser, identity)
+            mode = dy_transport["effective_mode"]
+            u, err = None, ""
+            if mode in {"api", "hybrid"}:
+                cookie = douyin_cookie_from_state(state)
+                if not cookie:
+                    err = "api_missing_cookie"
+                else:
+                    try:
+                        client = DouyinClient(
+                            cookie, a0.ua or cfg.engine.user_agent,
+                            timeout=cfg.engine.request_timeout_seconds,
+                            proxy=proxy, **douyin_client_environment(a0))
+                        async with client.session_scope():
+                            u = await client.fetch_self_profile()
+                            if not u and a0.sec_uid:
+                                u = await client.fetch_profile(a0.sec_uid)
+                        err = client.last_error or ("" if u else "empty_response")
+                    except Exception as exc:
+                        err = exc
+            if not u and mode == "hybrid":
+                if browser is None:
+                    return _done("error", err or "browser_unavailable")
+                u, browser_err = await fetch_self_profile(browser, identity)
+                err = browser_err or err
+            elif not u and mode == "browser":
+                if browser is None:
+                    return _done("error", "browser_unavailable")
+                u, err = await fetch_self_profile(browser, identity)
     except Exception as exc:
         category, _signal = classify_platform_error(exc)
         status = "invalid" if detailed and category == RiskCategory.AUTH else "error"
@@ -3108,15 +3157,6 @@ async def del_account(account_id: int):
 
 @app.post("/api/accounts/{account_id}/refresh-profile")
 async def refresh_account_profile(account_id: int):
-    manual_browser = open_browsers.get(account_id)
-    if manual_browser is not None and bool(
-            getattr(manual_browser, "active", True)):
-        return {
-            "ok": True,
-            "skipped": True,
-            "reason": "该账号浏览器窗口仍开着，请先关闭窗口再刷新资料",
-            "blocked_by": "open_browser",
-        }
     with get_session() as s:
         acc = s.get(DouyinAccount, account_id)
         if not acc:
@@ -3124,6 +3164,19 @@ async def refresh_account_profile(account_id: int):
         state = acc.storage_state or acc.creator_storage_state
         platform = acc.platform
         creator_state = acc.creator_storage_state or ""
+        profile_transport = (resolve_transport(
+            cfg, "douyin", "account_profile", acc)
+            if platform == "douyin" else None)
+    manual_browser = open_browsers.get(account_id)
+    if (manual_browser is not None
+            and bool(getattr(manual_browser, "active", True))
+            and (profile_transport is None or profile_transport["opens_browser"])):
+        return {
+            "ok": True,
+            "skipped": True,
+            "reason": "该账号浏览器窗口仍开着，请先关闭窗口再刷新资料",
+            "blocked_by": "open_browser",
+        }
     if not state:
         raise HTTPException(400, "该账号无浏览器登录态(Cookie 粘贴账号可能不含完整态),无法拉取资料")
 
@@ -3241,8 +3294,6 @@ async def list_account_works(account_id: int, limit: int = 200):
 @app.post("/api/accounts/{account_id}/works/sync")
 async def sync_account_works(account_id: int):
     """打开账号自己的主页,拦截抓取本账号已发布作品,落库(upsert)。"""
-    if browser is None:
-        raise HTTPException(503, "浏览器未就绪")
     if engine is None:
         raise HTTPException(503, "引擎未就绪")
     with get_session() as s:
@@ -3255,8 +3306,33 @@ async def sync_account_works(account_id: int):
             raise HTTPException(400, "账号代理不可用")
         platform = acc.platform
         uid = acc.sec_uid or ""
-        identity = browser.identity_for(acc)
+        transport = (resolve_transport(cfg, "douyin", "account_works", acc)
+                     if platform == "douyin" else None)
+        effective_mode = transport["effective_mode"] if transport else "browser"
+        if browser is None and effective_mode in {"browser", "hybrid"}:
+            raise HTTPException(503, "浏览器未就绪")
+        identity = (None if platform == "douyin" and effective_mode == "api"
+                    else browser.identity_for(acc))
+        direct_ua = (identity.ua if identity is not None
+                     else (acc.ua or cfg.engine.user_agent))
+        direct_environment = douyin_client_environment(
+            identity if identity is not None else acc)
+        source = "api" if effective_mode == "api" else "browser"
     async def _fetch():
+        nonlocal source
+        if platform == "douyin" and effective_mode in {"api", "hybrid"}:
+            cookie = douyin_cookie_from_state(acc.storage_state or acc.creator_storage_state or "")
+            api_items, api_err = await fetch_douyin_account_works_api(
+                cookie, direct_ua, uid,
+                timeout=cfg.engine.request_timeout_seconds, proxy=acc.proxy or "",
+                environment=direct_environment)
+            if api_items or effective_mode == "api" or api_err == "empty":
+                source = "api"
+                return api_items, api_err
+            print(f"[dy-account-works] API 空响应({api_err}),回退浏览器")
+            source = "browser_fallback"
+        else:
+            source = "browser"
         return await fetch_account_works(browser, identity, platform, uid)
 
     items, err = await engine.guarded_read_pair(
@@ -3264,7 +3340,9 @@ async def sync_account_works(account_id: int):
         _fetch, empty_result=[])
     if err.startswith("risk_deferred:"):
         return {"ok": True, "fetched": 0, "added": 0, "skipped": True,
-                "reason": err.split(":", 1)[-1]}
+                "reason": err.split(":", 1)[-1], "source": "deferred",
+                "configured_mode": (transport["configured_mode"]
+                                    if transport else "browser")}
     if not items:
         if err and err.startswith("missing_uid"):
             raise HTTPException(400, err.split(":", 1)[-1])
@@ -3287,7 +3365,10 @@ async def sync_account_works(account_id: int):
                                   fetched_at=now, **w))
                 added += 1
         s.commit()
-    return {"ok": True, "fetched": len(items), "added": added}
+    return {"ok": True, "fetched": len(items), "added": added,
+            "source": source,
+            "configured_mode": (transport["configured_mode"]
+                                if transport else "browser")}
 
 
 # ─────────── 本账号数据分析(B4:粉丝/作品/互动趋势 + 单篇作品表)───────────
@@ -3397,77 +3478,332 @@ def _follow_dict(f: FollowEdge) -> dict:
 
 
 @app.get("/api/follows")
-async def list_follows(account_id: int, direction: str = "following", limit: int = 500):
-    with get_session() as s:
-        q = (select(FollowEdge).where(FollowEdge.account_id == account_id,
-                                      FollowEdge.direction == direction)
-             .order_by(FollowEdge.id.desc()).limit(limit))
-        return [_follow_dict(f) for f in s.exec(q).all()]
-
-
-@app.post("/api/accounts/{account_id}/follows/sync")
-async def sync_follows(account_id: int, direction: str = "following"):
-    if browser is None:
-        raise HTTPException(503, "浏览器未就绪")
+async def list_follows(account_id: int, direction: str = "following",
+                       page: int = 1, page_size: int = 50,
+                       query: str = ""):
     if direction not in ("following", "fan"):
         raise HTTPException(400, "direction 仅支持 following | fan")
+    page = max(1, int(page or 1))
+    page_size = max(1, min(int(page_size or 50), 200))
+    query = " ".join(str(query or "").strip().split())[:100]
+    filters = [FollowEdge.account_id == account_id,
+               FollowEdge.direction == direction]
+    if query:
+        match = f"%{query}%"
+        filters.append(or_(FollowEdge.nickname.like(match),
+                           FollowEdge.uid.like(match),
+                           FollowEdge.sec_uid.like(match),
+                           FollowEdge.signature.like(match)))
+    with get_session() as s:
+        total = int(s.exec(select(func.count(FollowEdge.id)).where(
+            *filters)).one() or 0)
+        pages = max(1, (total + page_size - 1) // page_size)
+        page = min(page, pages)
+        rows = s.exec(
+            select(FollowEdge).where(*filters)
+            .order_by(FollowEdge.id.desc())
+            .offset((page - 1) * page_size).limit(page_size)).all()
+        synced_at = s.exec(select(func.max(FollowEdge.fetched_at)).where(
+            FollowEdge.account_id == account_id,
+            FollowEdge.direction == direction)).one()
+    return {
+        "items": [_follow_dict(row) for row in rows],
+        "total": total, "page": page, "page_size": page_size,
+        "pages": pages,
+        "synced_at": synced_at.isoformat() if synced_at else None,
+    }
+
+
+@app.get("/api/follows/{edge_id}")
+async def get_follow(edge_id: int, account_id: int):
+    with get_session() as s:
+        row = s.get(FollowEdge, edge_id)
+        if not row or row.account_id != account_id:
+            raise HTTPException(404, "关注关系不存在")
+        return _follow_dict(row)
+
+
+def _replace_follow_snapshot(account_id: int, platform: str, direction: str,
+                             users: list[dict], now: datetime,
+                             progress=None) -> tuple[int, int]:
+    incoming: dict[str, dict] = {}
+    for user in users:
+        uid = str(user.get("uid") or "")
+        if uid:
+            incoming[uid] = user
+    with get_session() as s:
+        known = set(s.exec(select(FollowEdge.uid).where(
+            FollowEdge.account_id == account_id,
+            FollowEdge.direction == direction)).all())
+        # Delete + insert stays in one transaction: readers keep seeing the old
+        # snapshot until the complete replacement commits, and failures roll back.
+        s.execute(delete(FollowEdge).where(
+            FollowEdge.account_id == account_id,
+            FollowEdge.direction == direction))
+        mappings = []
+        total = len(incoming)
+        for index, (uid, user) in enumerate(incoming.items(), 1):
+            mappings.append({
+                "platform": platform, "account_id": account_id,
+                "direction": direction, "uid": uid,
+                "sec_uid": str(user.get("sec_uid") or ""),
+                "nickname": str(user.get("nickname") or ""),
+                "avatar": str(user.get("avatar") or ""),
+                "signature": str(user.get("signature") or ""),
+                "is_mutual": bool(user.get("is_mutual")),
+                "is_following": bool(user.get("is_following")),
+                "raw_json": str(user.get("raw_json") or ""),
+                "fetched_at": now, "created_at": now,
+            })
+            if len(mappings) >= 1000 or index == total:
+                s.bulk_insert_mappings(FollowEdge, mappings)
+                mappings.clear()
+                if progress is not None:
+                    progress({"phase": "saving", "saved": index,
+                              "fetched": total})
+        s.commit()
+    return sum(1 for uid in incoming if uid not in known), total
+
+
+async def _sync_follows_impl(account_id: int, direction: str = "following",
+                             progress=None):
+    if direction not in ("following", "fan"):
+        raise HTTPException(400, "direction 仅支持 following | fan")
+
+    def report(**changes):
+        if progress is not None:
+            progress(changes)
+
     with get_session() as s:
         acc = s.get(DouyinAccount, account_id)
         if not acc:
             raise HTTPException(404, "账号不存在")
         platform = acc.platform
         uid = acc.sec_uid or ""
-        identity = browser.identity_for(acc)
-        known = {f.uid for f in s.exec(select(FollowEdge).where(
-            FollowEdge.account_id == account_id,
-            FollowEdge.direction == direction)).all()}
-    # 抖音优先直连(following/follower list 分页,比弹窗滚动抓得全);失败再回退浏览器拦截
+        operation = "following_list" if direction == "following" else "followers_list"
+        transport = (resolve_transport(cfg, "douyin", operation, acc)
+                     if platform == "douyin" else None)
+        effective_mode = (transport["effective_mode"] if transport else "browser")
+        if effective_mode == "unavailable":
+            raise HTTPException(
+                409,
+                f"当前读取方式与{('关注' if direction == 'following' else '粉丝')}列表不兼容："
+                f"{transport.get('reason') or transport.get('note') or '该通道不可用'}")
+        if browser is None and effective_mode in {"browser", "hybrid"}:
+            raise HTTPException(503, "浏览器未就绪")
+        if platform == "douyin" and effective_mode in {"api", "hybrid"} \
+                and engine is None:
+            raise HTTPException(503, "抖音 API 读取引擎未就绪")
+        identity = (None if platform == "douyin" and effective_mode == "api"
+                    else browser.identity_for(acc))
+        known: set[str] = set()
+    # API-only/browser-only are hard routing decisions. Hybrid's API attempt and
+    # page fallback share one READ_HEAVY guard so the fallback is not blocked by
+    # the API attempt's own minimum interval.
     users, err = [], ""
-    attempted_direct = platform == "douyin" and engine is not None
-    if attempted_direct:
-        try:
-            users, derr = await engine.fetch_douyin_follows_direct(account_id, direction)
-        except Exception as e:
-            users, derr = [], repr(e)
-        if derr.startswith("risk_deferred:"):
-            return {"ok": True, "fetched": 0, "added": 0, "skipped": True,
-                    "reason": derr.split(":", 1)[-1]}
-        if not users and derr not in ("", "empty"):
-            print(f"[follow] douyin direct 空({derr}),回退浏览器拦截")
-    allow_browser_fallback = (not attempted_direct or derr == "no_cookie")
-    if not users and allow_browser_fallback:
-        if engine is not None:
-            async def _fetch_browser_follows():
-                return await fetch_follows(
-                    browser, identity, platform, uid, direction, known)
+    source = "api" if effective_mode == "api" else "browser"
 
-            users, err = await engine.guarded_read_pair(
-                account_id, OperationKind.READ_HEAVY,
-                f"follows-browser:{account_id}:{direction}",
-                _fetch_browser_follows, empty_result=[])
-            if err.startswith("risk_deferred:"):
-                return {"ok": True, "fetched": 0, "added": 0,
-                        "skipped": True, "reason": err.split(":", 1)[-1]}
-        else:
-            users, err = await fetch_follows(
-                browser, identity, platform, uid, direction, known)
-    # 仅在登录态/缺 id 这类硬错误时报错;抓到 0 条不报错(可能确实没有,或接口待标定)
+    async def _fetch_follow_snapshot():
+        nonlocal source
+        direct_err = ""
+        if platform == "douyin" and effective_mode in {"api", "hybrid"}:
+            report(phase="fetching", source="api")
+            try:
+                if progress is None:
+                    direct_users, direct_err = (
+                        await engine._fetch_douyin_follows_direct_locked(
+                            account_id, direction))
+                else:
+                    def direct_progress(update):
+                        report(phase="fetching", source="api", **update)
+
+                    direct_users, direct_err = (
+                        await engine._fetch_douyin_follows_direct_locked(
+                            account_id, direction, progress=direct_progress))
+            except Exception as e:
+                direct_users, direct_err = [], repr(e)
+            # “empty”表示结构有效的空列表；empty_body/网络/解析错误不是有效快照。
+            if direct_users or direct_err == "empty":
+                source = "api"
+                return direct_users, direct_err
+            if effective_mode == "api":
+                source = "api"
+                return [], direct_err or "empty_response"
+            print(f"[follow] douyin direct 空({direct_err}),回退浏览器拦截")
+
+        source = "browser_fallback" if effective_mode == "hybrid" else "browser"
+        report(phase="fetching", source=source)
+        browser_users, browser_err = await fetch_follows(
+            browser, identity, platform, uid, direction, known)
+        if browser_users:
+            return browser_users, ""
+        return browser_users, (browser_err or direct_err)
+
+    if engine is not None:
+        users, err = await engine.guarded_read_pair(
+            account_id, OperationKind.READ_HEAVY,
+            f"follows-sync:{account_id}:{direction}",
+            _fetch_follow_snapshot, empty_result=[])
+    else:
+        users, err = await _fetch_follow_snapshot()
+
+    if err.startswith("risk_deferred:"):
+        return {"ok": True, "fetched": 0, "added": 0,
+                "skipped": True, "reason": err.split(":", 1)[-1],
+                "source": "deferred",
+                "configured_mode": (transport["configured_mode"]
+                                    if transport else "browser")}
     if err and err.startswith("missing_uid"):
         raise HTTPException(400, err.split(":", 1)[-1])
     if err and err.startswith("logged_out"):
         raise HTTPException(400, "登录态已失效,请点「重新登录」")
+    # 只有明确解析到平台的有效空列表("empty")才允许清空旧快照。超时、空 body、
+    # 未命中接口等不确定结果必须保留旧数据，并把真实失败显示给前端。
+    if err and err != "empty":
+        label = "关注" if direction == "following" else "粉丝"
+        raise HTTPException(502, f"{label}同步未取得有效列表，已保留原数据：{err}")
     now = datetime.utcnow()
+    report(phase="saving", fetched=len(users), saved=0)
+    added, stored = await asyncio.to_thread(
+        _replace_follow_snapshot, account_id, platform, direction,
+        users, now, progress)
+    return {"ok": True, "fetched": len(users), "stored": stored,
+            "added": added, "complete": True,
+            "source": source,
+            "configured_mode": (transport["configured_mode"]
+                                 if transport else "browser")}
+
+
+@app.post("/api/accounts/{account_id}/follows/sync")
+async def sync_follows(account_id: int, direction: str = "following"):
+    return await _sync_follows_impl(account_id, direction)
+
+
+def _follow_sync_job_view(job: dict) -> dict:
+    view = dict(job)
+    expected = max(0, int(view.get("expected_total") or 0))
+    fetched = max(0, int(view.get("fetched") or 0))
+    if view.get("status") == "completed":
+        percent = 100
+    elif expected:
+        percent = min(99, int(fetched * 100 / expected))
+    else:
+        percent = None
+    view["percent"] = percent
+    view["cancelable"] = (view.get("status") in {"queued", "running"}
+                          and view.get("phase") != "saving")
+    return view
+
+
+async def _run_follow_sync_job(job_id: str):
+    job = _follow_sync_jobs[job_id]
+
+    def update(changes: dict):
+        job.update(changes)
+        job["updated_at"] = datetime.utcnow().isoformat()
+
+    update({"status": "running", "phase": "fetching"})
+    try:
+        result = await _sync_follows_impl(
+            int(job["account_id"]), str(job["direction"]), progress=update)
+        if result.get("skipped"):
+            update({"status": "deferred", "phase": "deferred",
+                    "error": str(result.get("reason") or "同步暂缓"),
+                    "result": result,
+                    "completed_at": datetime.utcnow().isoformat()})
+            return
+        update({"status": "completed", "phase": "completed",
+                "fetched": int(result.get("fetched") or 0),
+                "saved": int(result.get("stored") or 0),
+                "added": int(result.get("added") or 0),
+                "source": result.get("source") or "",
+                "result": result, "completed_at": datetime.utcnow().isoformat()})
+    except asyncio.CancelledError:
+        update({"status": "canceled", "phase": "canceled",
+                "completed_at": datetime.utcnow().isoformat()})
+    except HTTPException as exc:
+        update({"status": "failed", "phase": "failed",
+                "error": str(exc.detail),
+                "completed_at": datetime.utcnow().isoformat()})
+    except Exception as exc:
+        update({"status": "failed", "phase": "failed",
+                "error": repr(exc),
+                "completed_at": datetime.utcnow().isoformat()})
+
+
+@app.post("/api/accounts/{account_id}/follows/sync-jobs", status_code=202)
+async def start_follow_sync_job(account_id: int,
+                                direction: str = "following"):
+    if direction not in ("following", "fan"):
+        raise HTTPException(400, "direction 仅支持 following | fan")
     with get_session() as s:
-        # 快照式替换:先清掉该账号该方向旧数据(含历史误抓的 JS 模块垃圾),再写入本次精确快照
-        for old in s.exec(select(FollowEdge).where(
-                FollowEdge.account_id == account_id,
-                FollowEdge.direction == direction)).all():
-            s.delete(old)
-        for u in users:
-            s.add(FollowEdge(platform=platform, account_id=account_id,
-                             direction=direction, fetched_at=now, **u))
-        s.commit()
-    return {"ok": True, "fetched": len(users), "added": len(users)}
+        account = s.get(DouyinAccount, account_id)
+        if not account:
+            raise HTTPException(404, "账号不存在")
+        expected_total = (account.following_count if direction == "following"
+                          else account.follower_count)
+    for existing in reversed(list(_follow_sync_jobs.values())):
+        if (existing.get("account_id") == account_id
+                and existing.get("direction") == direction
+                and existing.get("status") in {"queued", "running"}):
+            return _follow_sync_job_view(existing)
+    completed = [key for key, value in _follow_sync_jobs.items()
+                 if value.get("status") in {"completed", "failed", "canceled"}]
+    for key in completed[:-100]:
+        _follow_sync_jobs.pop(key, None)
+        _follow_sync_tasks.pop(key, None)
+    now = datetime.utcnow().isoformat()
+    job_id = uuid.uuid4().hex
+    job = {
+        "id": job_id, "account_id": account_id, "direction": direction,
+        "status": "queued", "phase": "queued", "pages": 0,
+        "fetched": 0, "saved": 0, "added": 0,
+        "expected_total": max(0, int(expected_total or 0)),
+        "source": "", "error": "", "created_at": now,
+        "updated_at": now, "completed_at": None,
+    }
+    _follow_sync_jobs[job_id] = job
+    task = asyncio.create_task(_run_follow_sync_job(job_id))
+    _follow_sync_tasks[job_id] = task
+    task.add_done_callback(lambda _task, key=job_id:
+                           _follow_sync_tasks.pop(key, None))
+    return _follow_sync_job_view(job)
+
+
+@app.get("/api/follow-sync-jobs/{job_id}")
+async def get_follow_sync_job(job_id: str):
+    job = _follow_sync_jobs.get(job_id)
+    if not job:
+        raise HTTPException(404, "同步任务不存在")
+    return _follow_sync_job_view(job)
+
+
+@app.get("/api/accounts/{account_id}/follows/sync-job")
+async def get_latest_follow_sync_job(account_id: int,
+                                     direction: str = "following"):
+    for job in reversed(list(_follow_sync_jobs.values())):
+        if (job.get("account_id") == account_id
+                and job.get("direction") == direction):
+            return _follow_sync_job_view(job)
+    return {"status": "idle", "account_id": account_id,
+            "direction": direction}
+
+
+@app.post("/api/follow-sync-jobs/{job_id}/cancel")
+async def cancel_follow_sync_job(job_id: str):
+    job = _follow_sync_jobs.get(job_id)
+    if not job:
+        raise HTTPException(404, "同步任务不存在")
+    if job.get("status") not in {"queued", "running"}:
+        return _follow_sync_job_view(job)
+    if job.get("phase") == "saving":
+        raise HTTPException(409, "数据正在提交，不能中途取消")
+    job["status"] = "canceling"
+    job["updated_at"] = datetime.utcnow().isoformat()
+    task = _follow_sync_tasks.get(job_id)
+    if task:
+        task.cancel()
+    return _follow_sync_job_view(job)
 
 
 # ─────────── 本账号管理:私信 ───────────
@@ -3513,14 +3849,25 @@ async def list_dm_messages(account_id: int, conv_id: str, limit: int = 200):
 
 @app.post("/api/accounts/{account_id}/dm/sync")
 async def sync_dm(account_id: int):
-    if browser is None:
-        raise HTTPException(503, "浏览器未就绪")
     with get_session() as s:
         acc = s.get(DouyinAccount, account_id)
         if not acc:
             raise HTTPException(404, "账号不存在")
         platform = acc.platform
-        identity = browser.identity_for(acc)
+        dm_transport = (resolve_transport(cfg, "douyin", "dm_sync", acc)
+                        if platform == "douyin" else None)
+        if dm_transport and dm_transport["effective_mode"] == "unavailable":
+            raise HTTPException(409, dm_transport["reason"] or "当前私信同步通道不可用")
+        effective_mode = (dm_transport["effective_mode"]
+                          if dm_transport else "browser")
+        if browser is None and effective_mode == "browser":
+            raise HTTPException(503, "浏览器未就绪")
+        identity = (browser.identity_for(acc)
+                    if browser is not None and effective_mode != "api" else None)
+        state = acc.storage_state or acc.creator_storage_state or ""
+        ua = acc.ua or cfg.engine.user_agent
+        proxy = acc.proxy or ""
+        direct_environment = douyin_client_environment(acc)
     if engine is None:
         raise HTTPException(503, "引擎未就绪")
     if platform == "xhs":
@@ -3543,8 +3890,34 @@ async def sync_dm(account_id: int):
             "cached": bool(result.get("skipped") and cached_conversations),
             "reason": result.get("reason") or "",
         }
+    source = "api" if effective_mode == "api" else "browser"
+
     async def _fetch_conversations():
-        return await fetch_dm_conversations(browser, identity, platform)
+        nonlocal source
+        api_error = ""
+        if platform == "douyin" and effective_mode in {"api", "hybrid"}:
+            cookie = douyin_cookie_from_state(state)
+            if not cookie:
+                api_error = "api_missing_cookie"
+            else:
+                client = DouyinClient(
+                    cookie, ua, timeout=cfg.engine.request_timeout_seconds,
+                    proxy=proxy, **direct_environment)
+                async with client.session_scope():
+                    direct = await client.fetch_dm_conversations()
+                api_error = client.last_error or ""
+                if direct or not api_error:
+                    source = "api"
+                    return direct, ""
+            if effective_mode == "api":
+                source = "api"
+                return [], api_error or "empty_response"
+        if browser is None or identity is None:
+            return [], api_error or "browser_unavailable"
+        source = "browser_fallback" if effective_mode == "hybrid" else "browser"
+        conversations, browser_error = await fetch_dm_conversations(
+            browser, identity, platform)
+        return conversations, browser_error or api_error
 
     convs, err = await engine.guarded_read_pair(
         account_id, OperationKind.READ_HEAVY, f"dm:{account_id}",
@@ -3604,7 +3977,10 @@ async def sync_dm(account_id: int):
                 acc2.uid = self_uid
                 s.add(acc2)
         s.commit()
-    return {"ok": True, "fetched": len(convs), "added": len(convs), "messages": msgs}
+    return {"ok": True, "fetched": len(convs), "added": len(convs),
+            "messages": msgs, "source": source,
+            "configured_mode": (dm_transport["configured_mode"]
+                                if dm_transport else "browser")}
 
 
 @app.get("/api/dm/stream")
@@ -3950,6 +4326,7 @@ def _action_dict(t: AccountActionTask) -> dict:
         "action": t.action, "target_uid": t.target_uid, "target_nick": t.target_nick,
         "conv_id": t.conv_id,
         "content": t.content, "status": t.status, "result": t.result,
+        "method": t.method,
         "source_msg_id": t.source_msg_id, "source_rule_id": t.source_rule_id,
         "scheduled_at": t.scheduled_at.isoformat() if t.scheduled_at else None,
         "error": t.error, "created_at": t.created_at.isoformat() if t.created_at else None,
@@ -4009,6 +4386,7 @@ async def create_account_action(body: ActionIn, request: Request = None):
         task = s.get(AccountActionTask, payload["id"])
         payload.update(status=task.status if task else "deleted",
                        ran=bool(task and task.status == "done"),
+                       method=(task.method if task else ""),
                        execution_error=detail or (task.error if task else ""))
     return payload
 
@@ -4018,7 +4396,9 @@ async def run_account_action(task_id: int):
     ok, detail = await _exec_action(task_id)
     if not ok:
         raise HTTPException(400, f"执行失败:{detail}")
-    return {"ok": True}
+    with get_session() as session:
+        task = session.get(AccountActionTask, task_id)
+        return {"ok": True, "method": task.method if task else ""}
 
 
 @app.put("/api/account-actions/{task_id}")
@@ -4969,6 +5349,15 @@ async def get_engine_settings():
     return export_engine_settings(cfg)
 
 
+@app.get("/api/settings/transport-matrix")
+async def get_transport_matrix():
+    """Expose actual route support plus account-level isolation diagnostics."""
+    with get_session() as session:
+        accounts = session.exec(
+            select(DouyinAccount).order_by(DouyinAccount.id)).all()
+        return build_transport_matrix(cfg, accounts)
+
+
 @app.put("/api/settings/engine", openapi_extra={
     "requestBody": {"content": {"application/json": {
         "schema": EngineSettingsPatch.model_json_schema()}}}})
@@ -4989,6 +5378,17 @@ async def put_engine_settings(body: Any = Body(...)):
     downloader = getattr(engine, "downloader", None)
     if downloader is not None and "download_timeout_seconds" in body:
         downloader.timeout = cfg.engine.download_timeout_seconds
+    # BrowserManager snapshots native write-gate values at construction. Keep
+    # those hot-reloadable switches in sync when they are edited from the UI;
+    # other browser executable/profile settings intentionally remain restart-only.
+    if browser is not None:
+        for key in (
+                "native_write_gate_enabled",
+                "native_write_require_system_chrome",
+                "native_write_require_verified_proxy",
+                "native_write_proxy_max_age_seconds"):
+            if key in body and hasattr(browser, key):
+                setattr(browser, key, getattr(cfg.engine, key))
     return result
 
 
@@ -5416,7 +5816,8 @@ async def _douyin_native_share(
     cookie = douyin_cookie_from_state(state) or raw_cookie
     client = DouyinClient(cookie, user_agent,
                           timeout=cfg.engine.request_timeout_seconds,
-                          proxy=proxy)
+                          proxy=proxy,
+                          **douyin_client_environment(account))
     raw = await client.fetch_video_detail(aweme_id)
     if not raw:
         raise ShareDownloadError(
@@ -6040,7 +6441,7 @@ def _meta_matches(item: MonitorTarget | CommentWatch, group_name: str, tag: str)
     return True
 
 
-# ─────────── 关键词批量采集（当前版本：抖音）───────────
+# ─────────── 抖音 / 小红书关键词批量采集 ───────────
 class KeywordCollectionIn(BaseModel):
     platform: str = "douyin"
     account_id: int
@@ -6064,8 +6465,8 @@ def _validated_collection_input(body: KeywordCollectionIn) \
         -> tuple[str, list[str], str, str, dict]:
     """校验创建/编辑共用的任务配置并返回规范化值。"""
     platform = body.platform.strip().lower()
-    if platform != "douyin":
-        raise HTTPException(400, "当前版本关键词批量采集仅支持抖音")
+    if platform not in {"douyin", "xhs"}:
+        raise HTTPException(400, "关键词批量采集仅支持抖音或小红书")
     keywords = _collection_keywords(body.keywords)
     if not keywords:
         raise HTTPException(400, "请至少填写一个关键词")
@@ -6250,9 +6651,16 @@ def _collection_local_media_paths(row: KeywordCollectionContent) -> list[Path]:
 
 
 def _collection_content_dict(row: KeywordCollectionContent) -> dict:
-    url = (f"https://www.xiaohongshu.com/explore/{row.aweme_id}"
-           if row.platform == "xhs"
-           else f"https://www.douyin.com/video/{row.aweme_id}")
+    if row.platform == "xhs":
+        query = urlencode({
+            "xsec_token": row.xsec_token,
+            "xsec_source": row.xsec_source or "pc_search",
+        }) if row.xsec_token else ""
+        url = f"https://www.xiaohongshu.com/explore/{row.aweme_id}"
+        if query:
+            url += "?" + query
+    else:
+        url = f"https://www.douyin.com/video/{row.aweme_id}"
     local_files = _collection_local_media_paths(row)
     remote_medias = _collection_remote_medias(row)
     try:
@@ -6268,6 +6676,7 @@ def _collection_content_dict(row: KeywordCollectionContent) -> dict:
         "comment_count": row.comment_count,
         "collected_comment_count": row.collected_comment_count,
         "download_status": row.download_status, "local_path": row.local_path,
+        "xsec_token": row.xsec_token, "xsec_source": row.xsec_source,
         "error": row.error, "url": url,
         "local_exists": bool(local_files),
         "media_count": len(local_files) or len(remote_medias),
@@ -6322,8 +6731,8 @@ async def update_keyword_collection(job_id: int, body: KeywordCollectionIn):
         job = session.get(KeywordCollectionJob, job_id)
         if not job:
             raise HTTPException(404, "采集任务不存在")
-        if job.platform != "douyin":
-            raise HTTPException(400, "当前版本仅支持编辑抖音采集任务")
+        if platform != job.platform:
+            raise HTTPException(400, "采集任务创建后不能变更平台")
         if job.status in {"pending", "running"}:
             raise HTTPException(409, "等待或执行中的任务请先取消，再编辑配置")
         account = session.get(DouyinAccount, body.account_id)
@@ -6674,6 +7083,26 @@ def _clean_platform_target_input(value: str, platform: str) -> str:
         )
     return target_input
 
+
+def _ensure_creator_monitor_available(session, *, platform: str, sec_uid: str,
+                                     account_id: int | None,
+                                     exclude_id: int | None = None) -> None:
+    """主页监控按执行账号去重；暂停的任务仍占用该账号的目标。"""
+    query = select(MonitorTarget).where(
+        MonitorTarget.platform == platform, MonitorTarget.sec_uid == sec_uid)
+    if account_id:
+        query = query.where(MonitorTarget.account_id == account_id)
+    else:
+        # 兼容历史数据中的 0：与 None 都表示匿名执行。
+        query = query.where(or_(MonitorTarget.account_id.is_(None),
+                                MonitorTarget.account_id == 0))
+    if exclude_id is not None:
+        query = query.where(MonitorTarget.id != exclude_id)
+    if session.exec(query).first():
+        detail = "该账号已存在此主页的监控" if account_id else "该主页的匿名监控已存在"
+        raise HTTPException(409, detail)
+
+
 @app.post("/api/monitors")
 async def add_monitor(body: TargetIn):
     platform = body.platform if body.platform in ("douyin", "xhs", "kuaishou") else "douyin"
@@ -6703,8 +7132,8 @@ async def add_monitor(body: TargetIn):
             raise HTTPException(400, "无法解析 sec_uid,请粘贴完整分享文案、主页链接 / v.douyin.com 短链 / sec_uid")
 
     dl = body.download_dir.strip()
-    if not 60 <= body.interval_seconds <= 86400:
-        raise HTTPException(400, "监控间隔须为 60~86400 秒")
+    if not 1 <= body.interval_seconds <= 86400:
+        raise HTTPException(400, "监控间隔须为 1~86400 秒")
     if body.media_filter not in ("all", "video", "images"):
         raise HTTPException(400, "媒体筛选须为 all、video 或 images")
     _validate_monitor_strategy(
@@ -6735,11 +7164,11 @@ async def add_monitor(body: TargetIn):
         if kind == "keyword":
             dup = s.exec(select(MonitorTarget).where(MonitorTarget.platform == platform)
                          .where(MonitorTarget.keyword == keyword)).first()
+            if dup:
+                raise HTTPException(409, "该监控目标已存在")
         else:
-            dup = s.exec(select(MonitorTarget).where(MonitorTarget.platform == platform)
-                         .where(MonitorTarget.sec_uid == sec_uid)).first()
-        if dup:
-            raise HTTPException(409, "该监控目标已存在")
+            _ensure_creator_monitor_available(
+                s, platform=platform, sec_uid=sec_uid, account_id=body.account_id)
         q = body.video_quality.strip()
         if q and q not in QUALITY_CHOICES:
             raise HTTPException(400, f"画质取值无效: {q}")
@@ -6754,7 +7183,7 @@ async def add_monitor(body: TargetIn):
                           alias=_meta_text(body.alias, 60),
                           group_name=_meta_text(body.group_name, 40),
                           tags=_dump_meta_tags(_meta_tags(body.tags)),
-                          account_id=body.account_id,
+                          account_id=body.account_id or None,
                           interval_seconds=body.interval_seconds, download_dir=dl,
                           initial_backfill_count=backfill_count, video_quality=q,
                           download_enabled=body.download_enabled,
@@ -6788,8 +7217,8 @@ async def update_monitor(tid: int, body: TargetUpdate):
                     raise HTTPException(400, f"下载目录不可用: {e}")
             t.download_dir = dl
         if body.interval_seconds is not None:
-            if not 60 <= body.interval_seconds <= 86400:
-                raise HTTPException(400, "监控间隔须为 60~86400 秒")
+            if not 1 <= body.interval_seconds <= 86400:
+                raise HTTPException(400, "监控间隔须为 1~86400 秒")
             t.interval_seconds = body.interval_seconds
         if body.initial_backfill_count is not None:
             if t.last_scan_at is not None:
@@ -6835,6 +7264,10 @@ async def update_monitor(tid: int, body: TargetUpdate):
             acc = s.get(DouyinAccount, body.account_id)
             if not acc or acc.platform != t.platform or acc.status != "active":
                 raise HTTPException(400, "账号不存在、登录态失效或与监控平台不匹配")
+            if t.target_kind != "keyword":
+                _ensure_creator_monitor_available(
+                    s, platform=t.platform, sec_uid=t.sec_uid,
+                    account_id=body.account_id, exclude_id=t.id)
             t.account_id = body.account_id
         if body.alias is not None:
             t.alias = _meta_text(body.alias, 60)
@@ -7936,8 +8369,8 @@ async def add_watch(body: WatchIn):
     title = ""
     target_input = _clean_platform_target_input(body.url_or_id, platform)
 
-    if not 60 <= body.interval_seconds <= 86400:
-        raise HTTPException(400, "监控间隔须为 60~86400 秒")
+    if not 1 <= body.interval_seconds <= 86400:
+        raise HTTPException(400, "监控间隔须为 1~86400 秒")
     if not 0 <= body.recent_works <= 50:
         raise HTTPException(400, "近期作品数须为 0~50，0 表示跟随全局设置")
     if not 0 <= body.recent_days <= 365:
@@ -8039,8 +8472,8 @@ async def update_watch(wid: int, body: WatchUpdate):
         w = s.get(CommentWatch, wid)
         if not w:
             raise HTTPException(404)
-        if body.interval_seconds is not None and not 60 <= body.interval_seconds <= 86400:
-            raise HTTPException(400, "监控间隔须为 60~86400 秒")
+        if body.interval_seconds is not None and not 1 <= body.interval_seconds <= 86400:
+            raise HTTPException(400, "监控间隔须为 1~86400 秒")
         if body.enabled is not None:
             w.enabled = body.enabled
         if body.interval_seconds is not None:
@@ -8434,8 +8867,8 @@ async def add_danmaku_watch(body: DanmakuWatchIn):
     if body.platform != "douyin":
         raise HTTPException(400, "短视频弹幕监控当前仅支持抖音")
     target_input = _clean_platform_target_input(body.url_or_id, "douyin")
-    if body.interval_seconds != 0 and not 60 <= body.interval_seconds <= 86400:
-        raise HTTPException(400, "监控间隔须为 60~86400 秒,或填 0 跟随全局")
+    if body.interval_seconds != 0 and not 1 <= body.interval_seconds <= 86400:
+        raise HTTPException(400, "监控间隔须为 1~86400 秒,或填 0 跟随全局")
     if not 0 <= body.recent_works <= 50:
         raise HTTPException(400, "近期作品数须为 0~50")
     if not 0 <= body.recent_days <= 365:
@@ -8529,8 +8962,8 @@ async def update_danmaku_watch(wid: int, body: DanmakuWatchUpdate):
         if not watch:
             raise HTTPException(404, "弹幕监控不存在")
         if body.interval_seconds is not None and body.interval_seconds != 0 \
-                and not 60 <= body.interval_seconds <= 86400:
-            raise HTTPException(400, "监控间隔须为 60~86400 秒,或填 0 跟随全局")
+                and not 1 <= body.interval_seconds <= 86400:
+            raise HTTPException(400, "监控间隔须为 1~86400 秒,或填 0 跟随全局")
         if body.recent_works is not None and not 0 <= body.recent_works <= 50:
             raise HTTPException(400, "近期作品数须为 0~50")
         if body.recent_days is not None and not 0 <= body.recent_days <= 365:

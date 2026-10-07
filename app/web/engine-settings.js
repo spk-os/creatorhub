@@ -18,8 +18,8 @@
     if (el.type !== "number") return el.value;
     if (!el.value.trim()) return NaN;
     const scaled = Number(el.value) * Number(el.dataset.scale || 1);
-    // The minutes control stores whole seconds. Preserve file values such as
-    // 962 seconds across a display round-trip, without inventing an edited field.
+    // Scaled controls store whole seconds. Preserve file values such as
+    // 7201 seconds across a display round-trip, without inventing an edited field.
     return el.dataset.scale ? Math.round(scaled) : scaled;
   };
   const values = () => Object.fromEntries(fields.map(el => [el.name, value(el)]));
@@ -140,6 +140,7 @@
       baseline = { ...data.values }; recommended = { ...data.defaults }; dirty = false;
       render(baseline); retryButton.hidden = true;
       message("已保存 · 后续任务生效，重启后保留", "success");
+      globalThis.CreatorHubTransportMatrix?.load?.();
     } catch (error) {
       dirty = true;
       const invalid = [];
